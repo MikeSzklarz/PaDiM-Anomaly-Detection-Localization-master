@@ -5,31 +5,18 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 
 CLASS_NAMES = [
-    # "bottle",
-    # "cable",
-    # "capsule",
-    # "carpet",
-    # "grid",
-    # "hazelnut",
-    # "leather",
-    # "metal_nut",
-    # "pill",
-    # "screw",
-    # "tile",
-    # "toothbrush",
-    # "transistor",
-    "wood",
-    # "zipper",
+    "116"
 ]
 
 
-class MVTecDataset(Dataset):
+class BowtieDataset(Dataset):
     def __init__(
         self,
-        dataset_path="D:/dataset/mvtec_anomaly_detection",
-        class_name="bottle",
+        # TODO Change this path
+        dataset_path="idk for now",
+        class_name="116",
         is_train=True,
-        resize=256,
+        resize=512,
         cropsize=224,
     ):
         assert class_name in CLASS_NAMES, "class_name: {}, should be in {}".format(
@@ -77,7 +64,8 @@ class MVTecDataset(Dataset):
                 [
                     os.path.join(img_type_dir, f)
                     for f in os.listdir(img_type_dir)
-                    if f.endswith(".png")
+                    # TODO CHANGE THIS TO SOMETHING PASSED TO THE FUNCTION...... fkadsjfljkhadshgjlkdfas
+                    if f.endswith(".jpg")
                 ]
             )
             x.extend(img_fpath_list)
@@ -89,3 +77,16 @@ class MVTecDataset(Dataset):
 
         assert len(x) == len(y), "number of x and y should be same"
         return list(x), list(y)
+    
+    def print_dataset_info(self):
+        print("class_name: {}, is_train: {}".format(self.class_name, self.is_train))
+        print("number of data: {}".format(len(self.x)))
+        
+        num_good = len([1 for v in self.y if v == 0])
+        num_anomaly = len([1 for v in self.y if v == 1])
+        print("number of good: {}, number of anomaly: {}".format(num_good, num_anomaly))
+        print("dataset path: {}".format(self.dataset_path))
+        
+        phase = "train" if self.is_train else "test"
+        img_dir = os.path.join(self.dataset_path, self.class_name, phase)
+        print("image directory: {}".format(img_dir))
