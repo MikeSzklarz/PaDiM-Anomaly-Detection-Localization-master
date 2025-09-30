@@ -4,3 +4,4 @@ scikit-learn
 matplotlib
 scikit-image
 torchvision
+seaborn
