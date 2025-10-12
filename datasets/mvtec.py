@@ -5,21 +5,21 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 
 CLASS_NAMES = [
-    # "bottle",
-    # "cable",
-    # "capsule",
-    # "carpet",
-    # "grid",
-    # "hazelnut",
-    # "leather",
-    # "metal_nut",
-    # "pill",
-    # "screw",
-    # "tile",
-    # "toothbrush",
-    # "transistor",
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
     "wood",
-    # "zipper",
+    "zipper",
 ]
 
 
@@ -89,3 +89,17 @@ class MVTecDataset(Dataset):
 
         assert len(x) == len(y), "number of x and y should be same"
         return list(x), list(y)
+    
+    def print_dataset_info(self):
+        print("class_name: {}, is_train: {}".format(self.class_name, self.is_train))
+        print("number of data: {}".format(len(self.x)))
+        
+        num_good = len([1 for v in self.y if v == 0])
+        num_anomaly = len([1 for v in self.y if v == 1])
+        print("number of good: {}, number of anomaly: {}".format(num_good, num_anomaly))
+        print("dataset path: {}".format(self.dataset_path))
+        
+        phase = "train" if self.is_train else "test"
+        img_dir = os.path.join(self.dataset_path, self.class_name, phase)
+        print("image directory: {}".format(img_dir))
+
