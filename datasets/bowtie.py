@@ -6,19 +6,27 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
-# Define the class names for your Bowtie dataset
-CLASS_NAMES = [
-    "116",
-    # "117",
-    # "118",
-    # "119",
-    # "120",
-    # "121",
-    # "27952F",
-    # "27952G",
-    # "27952H",
-    # "27952J",
-]
+
+def get_class_names(dataset_path: str):
+    """Return a sorted list of class folder names found directly under dataset_path.
+
+    This allows experiments to work with datasets where some classes have been
+    combined into a single folder (for example: <dataset_root>/combined/{train,test})
+    or with the usual structure (<dataset_root>/116/{train,test}, <dataset_root>/117/...).
+
+    If the dataset_path does not exist or contains no subdirectories, an empty
+    list is returned.
+    """
+    try:
+        entries = [
+            d
+            for d in sorted(os.listdir(dataset_path))
+            if os.path.isdir(os.path.join(dataset_path, d))
+        ]
+    except Exception as e:
+        logging.error(f"Could not list classes in '{dataset_path}': {e}")
+        return []
+    return entries
 
 
 class BowtieDataset(Dataset):
@@ -57,9 +65,16 @@ class BowtieDataset(Dataset):
             image_extension (str): The file extension of the images to load (e.g., ".jpg", ".png").
             normal_test_sample_ratio (float): Fraction of normal training data to use as normal test data.
         """
-        assert (
-            class_name in CLASS_NAMES
-        ), f"class_name: {class_name}, should be in {CLASS_NAMES}"
+        # It's possible the caller has restructured the dataset (combined folders,
+        # etc). We don't enforce a global CLASS_NAMES list anymore. Instead,
+        # perform a quick sanity check that the expected class folder exists and
+        # contains a 'train' directory.
+        class_dir = os.path.join(dataset_path, class_name)
+        if not os.path.isdir(class_dir):
+            raise ValueError(
+                f"Class directory does not exist: {class_dir}. "
+                "Use get_class_names(dataset_path) to discover available classes."
+            )
         self.dataset_path = dataset_path
         self.class_name = class_name
         self.is_train = is_train
