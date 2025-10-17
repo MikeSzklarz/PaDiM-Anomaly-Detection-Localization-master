@@ -307,11 +307,6 @@ class BowtieDataManager:
             augmentations_enabled=False,
         )
 
-        # *** MODIFIED: Changed from print() to logging.info() ***
-        logging.info("Data manager created.")
-        logging.info(f"Training set size: {len(self.train)} images")
-        logging.info(f"Testing set size: {len(self.test)} images")
-
     def print_dataset_summary(self):
         """Prints a concise summary of what files and settings are being used.
 
