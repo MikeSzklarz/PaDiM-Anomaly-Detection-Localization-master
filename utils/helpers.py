@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
 from scipy import ndimage
 import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
 import logging
 from torch.amp import autocast
 
@@ -78,20 +80,70 @@ def plot_summary_visuals(
     plt.legend(loc="lower right")
     plt.savefig(os.path.join(class_save_dir, "roc_curve.png"))
     plt.close()
-
+    # --- Score distribution: overlayed density histplot with KDE and median lines ---
     plt.figure(figsize=(10, 6))
     normal_scores = img_scores[gt_labels == 0]
     abnormal_scores = img_scores[gt_labels == 1]
+
+    # Build DataFrame for seaborn hue plotting (safe when one group may be empty)
+    scores_list = []
+    labels_list = []
     if len(normal_scores) > 0:
-        plt.hist(normal_scores, bins=50, label="Normal Scores", color="blue", alpha=0.7)
+        scores_list.append(np.asarray(normal_scores))
+        labels_list.append(np.zeros(len(normal_scores), dtype=int))
     if len(abnormal_scores) > 0:
-        plt.hist(
-            abnormal_scores, bins=50, label="Anomalous Scores", color="red", alpha=0.7
+        scores_list.append(np.asarray(abnormal_scores))
+        labels_list.append(np.ones(len(abnormal_scores), dtype=int))
+
+    if scores_list:
+        scores_combined = np.concatenate(scores_list)
+        labels_combined = np.concatenate(labels_list)
+        score_df = pd.DataFrame({"score": scores_combined, "label": labels_combined})
+
+        palette = {0: "C0", 1: "C3"}
+        sns.histplot(
+            data=score_df,
+            x="score",
+            hue="label",
+            bins=50,
+            kde=True,
+            element="step",
+            stat="count",
+            common_norm=False,
+            palette=palette,
         )
+
+        # dashed median lines for each group
+        try:
+            if len(normal_scores) > 0:
+                med0 = np.median(normal_scores)
+                plt.axvline(med0, color=palette[0], linestyle="--", linewidth=1.5)
+            if len(abnormal_scores) > 0:
+                med1 = np.median(abnormal_scores)
+                plt.axvline(med1, color=palette[1], linestyle="--", linewidth=1.5)
+        except Exception:
+            pass
+
+        # friendly legend
+        handles, labels = plt.gca().get_legend_handles_labels()
+        if labels:
+            mapped = [
+                (
+                    "Normal"
+                    if l in ["0", "0.0"]
+                    else "Anomalous" if l in ["1", "1.0"] else l
+                )
+                for l in labels
+            ]
+            plt.legend(handles, mapped)
+
+    else:
+        # fallback: empty groups -- draw empty histogram axes
+        plt.hist([], bins=50)
+
     plt.xlabel("Image-Level Anomaly Score")
-    plt.ylabel("Frequency")
+    plt.ylabel("Count")
     plt.title("Distribution of Scores for Normal vs. Abnormal Images")
-    plt.legend()
     plt.xlim(0, 1)
     plt.savefig(os.path.join(class_save_dir, "score_distribution.png"))
     plt.close()
