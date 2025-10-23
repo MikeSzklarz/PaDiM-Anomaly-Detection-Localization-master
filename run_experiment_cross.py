@@ -55,6 +55,7 @@ from utils.helpers import (
 
 INTERMEDIATE_FEATURE_MAPS = []
 
+
 def setup_logging(log_path, log_name):
     """Configures a master logger for the entire experiment run."""
     log_file = os.path.join(log_path, f"{log_name}.log")
@@ -65,12 +66,20 @@ def setup_logging(log_path, log_name):
     )
     logging.info(f"Logging initialized. Log file at: {log_file}")
 
+
 def hook_function(module, input, output):
     """A simple hook that appends the output of a layer to a global list."""
     INTERMEDIATE_FEATURE_MAPS.append(output)
 
+
 def run_class_processing(args, class_name, model, device, random_feature_indices):
-    """Main function to process a single class: load data, train, test, and save results."""
+    """Main function to process a single class: load data, train, test, and save results.
+
+    Notes:
+    - `class_name` is treated as the training class name (train_class_name).
+    - If `args.test_class_name` is provided, testing will be performed on that class
+      (test_class_name). Otherwise the train class is used for testing (original behavior).
+    """
     global INTERMEDIATE_FEATURE_MAPS
 
     compute_device = torch.device("cpu")
@@ -87,14 +96,28 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
             "Mean/Covariance calculations will be performed on the CPU (default)."
         )
 
-    logging.info(f"--- Starting processing for CLASS: {class_name} ---")
+    train_class_name = class_name
+    test_class_name = (
+        args.test_class_name if args.test_class_name is not None else train_class_name
+    )
+
+    logging.info(
+        f"--- Starting processing for TRAIN: {train_class_name} | TEST: {test_class_name} ---"
+    )
 
     # --- 1. Setup & Dataloading ---
-    class_save_dir = os.path.join(args.master_save_dir, class_name)
+    if args.test_class_name is not None:
+        class_save_dir = os.path.join(
+            args.master_save_dir, f"train_{train_class_name}_test_{test_class_name}"
+        )
+    else:
+        class_save_dir = os.path.join(args.master_save_dir, train_class_name)
     os.makedirs(class_save_dir, exist_ok=True)
-    data_manager = bowtie.BowtieDataManager(
+
+    # Train data manager: augmentations applied according to args
+    train_data_manager = bowtie.BowtieDataManager(
         dataset_path=args.data_path,
-        class_name=class_name,
+        class_name=train_class_name,
         resize=args.resize,
         cropsize=args.cropsize,
         seed=args.seed,
@@ -104,14 +127,28 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
         augmentation_prob=args.augmentation_prob,
     )
 
+    # Test data manager: augmentations MUST be disabled for fair evaluation
+    test_data_manager = bowtie.BowtieDataManager(
+        dataset_path=args.data_path,
+        class_name=test_class_name,
+        resize=args.resize,
+        cropsize=args.cropsize,
+        seed=args.seed,
+        augmentations_enabled=False,
+        horizontal_flip=False,
+        vertical_flip=False,
+        augmentation_prob=0.0,
+    )
+
     # --- Verbose Logging Block ---
     logging.info("------------------- EXPERIMENT CONFIGURATION -------------------")
-    logging.info(f"[DATASET] Class Name: {class_name}")
     logging.info(f"[DATASET] Data Path: {args.data_path}")
-    logging.info(f"[DATASET] Train Set Size: {len(data_manager.train)} images")
-    logging.info(f"[DATASET] Test Set Size: {len(data_manager.test)} images")
-    normal_test_count = sum(1 for label in data_manager.test.labels if label == 0)
-    abnormal_test_count = len(data_manager.test.labels) - normal_test_count
+    logging.info(f"[DATASET] Train Class: {train_class_name}")
+    logging.info(f"[DATASET] Test Class: {test_class_name}")
+    logging.info(f"[DATASET] Train Set Size: {len(train_data_manager.train)} images")
+    logging.info(f"[DATASET] Test Set Size: {len(test_data_manager.test)} images")
+    normal_test_count = sum(1 for label in test_data_manager.test.labels if label == 0)
+    abnormal_test_count = len(test_data_manager.test.labels) - normal_test_count
     logging.info(
         f"[DATASET] Test Set Composition: {normal_test_count} Normal, {abnormal_test_count} Abnormal"
     )
@@ -148,10 +185,13 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
     logging.info("------------------------------------------------------------------")
 
     train_dataloader = DataLoader(
-        data_manager.train, batch_size=args.batch_size, pin_memory=True, shuffle=True
+        train_data_manager.train,
+        batch_size=args.batch_size,
+        pin_memory=True,
+        shuffle=True,
     )
     test_dataloader = DataLoader(
-        data_manager.test, batch_size=args.batch_size, pin_memory=True
+        test_data_manager.test, batch_size=args.batch_size, pin_memory=True
     )
     logging.info(f"Results for this class will be saved in: {class_save_dir}")
 
@@ -168,7 +208,12 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
 
         for image_batch, _, _ in train_dataloader:
             batch_embeddings = get_batch_embeddings(
-                image_batch, INTERMEDIATE_FEATURE_MAPS, random_feature_indices, model, device, compute_device
+                image_batch,
+                INTERMEDIATE_FEATURE_MAPS,
+                random_feature_indices,
+                model,
+                device,
+                compute_device,
             )
 
             b, c, h, w = batch_embeddings.shape
@@ -193,7 +238,12 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
 
         for image_batch, _, _ in train_dataloader:
             batch_embeddings = get_batch_embeddings(
-                image_batch, INTERMEDIATE_FEATURE_MAPS, random_feature_indices, model, device, compute_device
+                image_batch,
+                INTERMEDIATE_FEATURE_MAPS,
+                random_feature_indices,
+                model,
+                device,
+                compute_device,
             )
 
             b, c, h, w = batch_embeddings.shape
@@ -271,7 +321,12 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
         # moves the final embedding to the specified `target_device`. We now pass `eval_device`.
         with torch.no_grad(), autocast(device_type=device.type):
             batch_embeddings = get_batch_embeddings(
-                image_batch, INTERMEDIATE_FEATURE_MAPS, random_feature_indices, model, device, eval_device
+                image_batch,
+                INTERMEDIATE_FEATURE_MAPS,
+                random_feature_indices,
+                model,
+                device,
+                eval_device,
             )
 
         b, c, h, w = batch_embeddings.shape
@@ -467,7 +522,7 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
         writer.writeheader()
         predictions = (image_level_scores >= optimal_threshold).astype(int)
         for i, stats in enumerate(per_image_stats):
-            filepath = data_manager.test.image_filepaths[i]
+            filepath = test_data_manager.test.image_filepaths[i]
             gt = int(ground_truth_labels[i])
             pred = int(predictions[i])
             row = {
@@ -485,7 +540,7 @@ def run_class_processing(args, class_name, model, device, random_feature_indices
         norm_scores=normalized_scores,
         img_scores=image_level_scores,
         save_dir=os.path.join(class_save_dir, "visualizations"),
-        test_filepaths=data_manager.test.image_filepaths,
+        test_filepaths=test_data_manager.test.image_filepaths,
         per_image_stats=per_image_stats,
         optimal_threshold=optimal_threshold,
     )
@@ -713,6 +768,12 @@ def main():
         type=str,
         default="",
         help="Optional subfolder inside the base results directory to save results (e.g. 'custom_folder'). If empty, saves directly in base_results_dir.)",
+    )
+    parser.add_argument(
+        "--test_class_name",
+        type=str,
+        default=None,
+        help="Optional: If provided, use this class from the data_path for testing, instead of the training class.",
     )
     parser.add_argument(
         "--mahalanobis_on_gpu",
