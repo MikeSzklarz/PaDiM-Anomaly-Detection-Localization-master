@@ -254,9 +254,9 @@ class _BowtieSubset(Dataset):
         return len(self.image_filepaths)
 
 
-class BowtieDataManager:
+class BowtieDataLoader:
     """
-    A data manager class that handles finding, splitting, and preparing the
+    A data loader class that handles finding, splitting, and preparing the
     Bowtie train and test datasets.
     """
 
@@ -275,7 +275,7 @@ class BowtieDataManager:
         augmentation_prob: float = 0.5,
     ):
         """
-        Initializes the data manager, which finds all files, performs a
+        Initializes the data loader, which finds all files, performs a
         clean train/test split, and creates the dataset objects.
         """
         random.seed(seed)  # Set seed for reproducible splits
