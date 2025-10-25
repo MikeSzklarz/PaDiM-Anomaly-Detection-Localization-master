@@ -163,8 +163,9 @@ def plot_mean_anomaly_maps(
     else:
         preds = None
 
-    # Prepare containers for the four outcome types in order [TN, FP, FN, TP]
-    outcome_names = ["TN", "FP", "FN", "TP"]
+    # Prepare containers for the four outcome types in order [TN, FP, TP, FN]
+    # NOTE: swapped TP and FN columns as requested (TP now appears before FN).
+    outcome_names = ["TN", "FP", "TP", "FN"]
     mean_raw = {k: np.zeros_like(anomaly_maps_raw[0]) for k in outcome_names}
     mean_up = {k: np.zeros_like(score_maps[0]) for k in outcome_names}
 
@@ -222,7 +223,7 @@ def plot_mean_anomaly_maps(
         ax_up.axes.xaxis.set_visible(False)
         ax_up.axes.yaxis.set_visible(False)
 
-    save_path = os.path.join(class_save_dir, "mean_anomaly_maps_by_outcome.png")
+    save_path = os.path.join(class_save_dir, "mean_anomaly_maps.png")
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path)
     plt.close(fig)
