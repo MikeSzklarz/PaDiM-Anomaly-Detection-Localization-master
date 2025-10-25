@@ -200,9 +200,7 @@ def plot_mean_anomaly_maps(
 
     # Create 2x4 figure: columns are TN,FP,FN,TP; top row raw, bottom row upscaled
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    fig.suptitle(
-        "Mean Anomaly Maps (top: raw, bottom: upscaled)", fontsize=18
-    )
+    fig.suptitle("Mean Anomaly Maps (top: raw, bottom: upscaled)", fontsize=18)
 
     for col, name in enumerate(outcome_names):
         inds = idx_map[name]
@@ -436,3 +434,335 @@ def plot_patch_score_distributions(class_save_dir, gt_labels, anomaly_maps_raw):
             os.path.join(class_save_dir, "patch_score_distribution_comparative.png")
         )
         plt.close(fig)
+
+
+def compute_and_save_blob_analysis(
+    class_save_dir,
+    analysis_results,
+    test_filepaths,
+    gt_labels,
+    img_scores=None,
+    optimal_threshold=None,
+    num_quadrants=10,
+):
+    """Flatten per-image blob analysis and save CSVs.
+
+    Produces two CSVs in `class_save_dir`:
+      - blob_analysis.csv : one row per blob with detailed attributes
+      - blob_image_summary.csv : one row per image summarizing blob counts & stats
+
+    Parameters
+    ----------
+    class_save_dir : str
+        Directory to save CSV files.
+    analysis_results : list
+        List of per-image dicts matching the notebook structure. Each dict is
+        expected to have keys like 'image_filename', 'blobs' (list of blob dicts),
+        and optionally 'image_gt_label'. Blob dicts should contain area, bbox,
+        mean_intensity, max_intensity, geometric_centroid, weighted_centroid, distance_from_center, quadrant, etc.
+    test_filepaths : list[str]
+        Original filepaths for the test images (used to infer folder/class names if missing from analysis_results).
+    gt_labels : array-like
+        Ground-truth labels per image (0=normal,1=anomalous).
+    img_scores : array-like, optional
+        Image-level anomaly scores used to compute TP/TN/FP/FN when combined with optimal_threshold.
+    optimal_threshold : float, optional
+        Threshold to turn image scores into binary predictions. If None and img_scores provided,
+        defaults to 0.5.
+    num_quadrants : int
+        Number of radial quadrants used when quadrant info isn't already present.
+
+    Returns
+    -------
+    tuple(pd.DataFrame, pd.DataFrame)
+        (blob_df, image_summary_df) dataframes that were written to disk.
+    """
+    os.makedirs(class_save_dir, exist_ok=True)
+
+    # Determine predictions per-image if scores provided
+    preds = None
+    if img_scores is not None:
+        if optimal_threshold is None:
+            used_threshold = 0.5
+        else:
+            used_threshold = optimal_threshold
+        preds = (np.asarray(img_scores) >= used_threshold).astype(int)
+
+    # Build flattened blob rows
+    blob_rows = []
+    image_summaries = []
+
+    # Ensure gt_labels is numpy array
+    gt_arr = np.asarray(gt_labels)
+
+    for idx, img_summary in enumerate(analysis_results):
+        # Provide fallbacks if notebook-style fields are missing
+        if isinstance(img_summary, dict):
+            image_filename = img_summary.get("image_filename")
+            blobs = img_summary.get("blobs", [])
+            img_gt = img_summary.get("image_gt_label")
+        else:
+            # If user passed a simple list of blobs per image, adapt
+            image_filename = None
+            blobs = img_summary
+            img_gt = None
+
+        if image_filename is None:
+            # fallback to test_filepaths list
+            try:
+                image_filename = os.path.basename(test_filepaths[idx])
+            except Exception:
+                image_filename = f"img_{idx}"
+
+        # infer gt_label
+        if img_gt is None:
+            try:
+                img_gt_val = int(gt_arr[idx])
+            except Exception:
+                img_gt_val = None
+        else:
+            img_gt_val = int(img_gt)
+
+        pred_val = int(preds[idx]) if preds is not None else None
+
+        # determine image-level outcome tag for all blobs in this image
+        if img_gt_val is None or pred_val is None:
+            image_outcome = None
+        else:
+            if img_gt_val == 0 and pred_val == 0:
+                image_outcome = "TN"
+            elif img_gt_val == 0 and pred_val == 1:
+                image_outcome = "FP"
+            elif img_gt_val == 1 and pred_val == 0:
+                image_outcome = "FN"
+            else:
+                image_outcome = "TP"
+
+        # Per-image aggregates used for image_summary_df
+        image_blob_count = 0
+        sum_blob_area = 0.0
+
+        for blob in blobs:
+            image_blob_count += 1
+            # Accept blob as dict and gracefully handle missing keys
+            row = {
+                "image_idx": idx,
+                "image_filename": image_filename,
+                "image_gt_label": img_gt_val,
+                "image_pred_label": pred_val,
+                "image_outcome": image_outcome,
+            }
+            # Copy known blob keys if present, else fill with None
+            row["blob_label"] = (
+                blob.get("blob_label") if isinstance(blob, dict) else None
+            )
+            row["area_pixels"] = (
+                blob.get("area_pixels") if isinstance(blob, dict) else None
+            )
+            row["bbox_x"] = (
+                blob.get("bounding_box", {}).get("x")
+                if isinstance(blob, dict)
+                else None
+            )
+            row["bbox_y"] = (
+                blob.get("bounding_box", {}).get("y")
+                if isinstance(blob, dict)
+                else None
+            )
+            row["bbox_width"] = (
+                blob.get("bounding_box", {}).get("width")
+                if isinstance(blob, dict)
+                else None
+            )
+            row["bbox_height"] = (
+                blob.get("bounding_box", {}).get("height")
+                if isinstance(blob, dict)
+                else None
+            )
+            row["mean_intensity"] = (
+                blob.get("mean_intensity") if isinstance(blob, dict) else None
+            )
+            row["max_intensity"] = (
+                blob.get("max_intensity") if isinstance(blob, dict) else None
+            )
+            geom = blob.get("geometric_centroid") if isinstance(blob, dict) else None
+            if geom is not None and len(geom) >= 2:
+                row["geometric_centroid_x"] = geom[0]
+                row["geometric_centroid_y"] = geom[1]
+            else:
+                row["geometric_centroid_x"] = None
+                row["geometric_centroid_y"] = None
+            wcent = blob.get("weighted_centroid") if isinstance(blob, dict) else None
+            if wcent is not None and len(wcent) >= 2:
+                row["weighted_centroid_x"] = wcent[0]
+                row["weighted_centroid_y"] = wcent[1]
+            else:
+                row["weighted_centroid_x"] = None
+                row["weighted_centroid_y"] = None
+            row["distance_from_center"] = (
+                blob.get("distance_from_center") if isinstance(blob, dict) else None
+            )
+            row["quadrant"] = blob.get("quadrant") if isinstance(blob, dict) else None
+
+            sum_blob_area += (
+                float(row["area_pixels"]) if row["area_pixels"] is not None else 0.0
+            )
+
+            blob_rows.append(row)
+
+        # Record per-image summary
+        image_summaries.append(
+            {
+                "image_idx": idx,
+                "image_filename": image_filename,
+                "image_gt_label": img_gt_val,
+                "image_pred_label": pred_val,
+                "image_outcome": image_outcome,
+                "blob_count": image_blob_count,
+                "total_blob_area": sum_blob_area,
+            }
+        )
+
+    # Convert to DataFrames
+    blob_df = pd.DataFrame(blob_rows)
+    image_summary_df = pd.DataFrame(image_summaries)
+
+    # Ensure we have an image filename and an image_name (basename without extension)
+    def _ensure_image_name(row, idx):
+        fname = row.get("image_filename") if isinstance(row, dict) else None
+        if not fname or fname is None or fname == "":
+            try:
+                fname = test_filepaths[idx]
+            except Exception:
+                fname = f"img_{idx}"
+        image_name = os.path.splitext(os.path.basename(fname))[0]
+        return fname, image_name
+
+    # Add image_filename and image_name to the image_summary_df (fill from provided or test_filepaths)
+    image_fnames = []
+    image_names = []
+    for i, rec in enumerate(image_summaries):
+        fname, iname = _ensure_image_name(rec, i)
+        image_fnames.append(fname)
+        image_names.append(iname)
+    image_summary_df["image_filename"] = image_fnames
+    image_summary_df["image_name"] = image_names
+
+    # If image-level scores are provided, attach them and predicted label/outcome were already set
+    if img_scores is not None:
+        image_summary_df["image_score"] = np.asarray(img_scores)[
+            : len(image_summary_df)
+        ]
+
+    # If blob_df is empty, create an empty grouped structure; otherwise aggregate per-image stats
+    if not blob_df.empty:
+        # normalize numeric columns
+        numeric_cols = [
+            "area_pixels",
+            "mean_intensity",
+            "max_intensity",
+            "weighted_centroid_x",
+            "weighted_centroid_y",
+            "distance_from_center",
+        ]
+        for c in numeric_cols:
+            if c in blob_df.columns:
+                blob_df[c] = pd.to_numeric(blob_df[c], errors="coerce")
+
+        grouped = (
+            blob_df.groupby("image_idx")
+            .agg(
+                blob_count=("blob_label", "count"),
+                total_blob_area=("area_pixels", "sum"),
+                mean_blob_area=("area_pixels", "mean"),
+                max_blob_area=("area_pixels", "max"),
+                mean_of_mean_intensity=("mean_intensity", "mean"),
+                max_intensity=("max_intensity", "max"),
+                mean_weighted_centroid_x=("weighted_centroid_x", "mean"),
+                mean_weighted_centroid_y=("weighted_centroid_y", "mean"),
+                mean_distance_from_center=("distance_from_center", "mean"),
+            )
+            .reset_index()
+        )
+
+        # quadrant counts per image (if quadrant column present)
+        if "quadrant" in blob_df.columns:
+            try:
+                quad_counts = (
+                    blob_df.groupby(["image_idx", "quadrant"])
+                    .size()
+                    .unstack(fill_value=0)
+                )
+                quad_counts = quad_counts.add_prefix("quadrant_")
+                quad_counts = quad_counts.reset_index()
+                grouped = grouped.merge(quad_counts, on="image_idx", how="left")
+            except Exception:
+                logging.exception("Failed to compute quadrant counts per image")
+
+    else:
+        # No blobs detected at all; create an empty grouped dataframe with image_idx covering all images
+        grouped = pd.DataFrame({"image_idx": image_summary_df["image_idx"].tolist()})
+
+    # Merge aggregated blob stats into the image summary frame
+    merged = image_summary_df.merge(grouped, on="image_idx", how="left")
+
+    # Fill missing numeric aggregate values sensibly
+    fill_zero_cols = [
+        "blob_count",
+        "total_blob_area",
+        "mean_blob_area",
+        "max_blob_area",
+        "mean_of_mean_intensity",
+        "max_intensity",
+        "mean_weighted_centroid_x",
+        "mean_weighted_centroid_y",
+        "mean_distance_from_center",
+    ]
+    for c in fill_zero_cols:
+        if c in merged.columns:
+            merged[c] = merged[c].fillna(0)
+
+    # Reorder columns for readability
+    image_summary_cols = [
+        "image_idx",
+        "image_name",
+        "image_filename",
+        "image_gt_label",
+        "image_score",
+        "image_pred_label",
+        "image_outcome",
+        "blob_count",
+        "total_blob_area",
+        "mean_blob_area",
+        "max_blob_area",
+        "mean_of_mean_intensity",
+        "max_intensity",
+        "mean_weighted_centroid_x",
+        "mean_weighted_centroid_y",
+        "mean_distance_from_center",
+    ]
+    # include any quadrant columns if present
+    quad_cols = [c for c in merged.columns if c.startswith("quadrant_")]
+    image_summary_cols.extend(quad_cols)
+
+    # Ensure all selected columns exist in merged, otherwise skip missing ones
+    image_summary_cols = [c for c in image_summary_cols if c in merged.columns]
+
+    final_image_summary_df = merged[image_summary_cols]
+
+    blob_csv_path = os.path.join(class_save_dir, "blob_analysis.csv")
+    image_summary_path = os.path.join(class_save_dir, "blob_image_summary.csv")
+
+    try:
+        blob_df.to_csv(blob_csv_path, index=False)
+        logging.info(f"Saved blob analysis CSV to: {blob_csv_path}")
+    except Exception:
+        logging.exception(f"Failed to write blob analysis CSV to: {blob_csv_path}")
+
+    try:
+        final_image_summary_df.to_csv(image_summary_path, index=False)
+        logging.info(f"Saved blob image summary CSV to: {image_summary_path}")
+    except Exception:
+        logging.exception(f"Failed to write image summary CSV to: {image_summary_path}")
+
+    return blob_df, final_image_summary_df

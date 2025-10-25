@@ -13,6 +13,7 @@ from sklearn.metrics import average_precision_score
 import scipy.stats as sps
 import csv
 import json
+import math
 
 import datasets.bowtie as bowtie
 from utils.embeddings import get_batch_embeddings
@@ -22,6 +23,8 @@ from utils.plotting import (
     plot_individual_visualizations,
     plot_patch_score_distributions,
 )
+from utils.plotting import compute_and_save_blob_analysis
+import cv2
 
 
 def run_class_processing(
@@ -455,6 +458,131 @@ def run_class_processing(
     # computed and passed to plotting functions, but we will not persist a
     # `per_image_metrics.csv` file to avoid creating large per-image artifacts.
     logging.info("Per-image metrics CSV export disabled by configuration.")
+
+    # --- Blob detection & detailed per-blob extraction (match notebook behavior) ---
+    # We will detect connected components on a binary mask defined by the
+    # threshold_norm computed from normal images and extract properties per blob.
+    analysis_results = []
+    n_images = normalized_scores.shape[0]
+    for i in range(n_images):
+        heat = normalized_scores[i]
+        thresh_val = threshold_norm
+        mask = (heat >= thresh_val).astype(np.uint8) * 255
+        # Morphological cleanup to mimic notebook
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
+
+        blobs_in_image = []
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area <= 0:
+                continue
+            bbox_x = int(stats[label, cv2.CC_STAT_LEFT])
+            bbox_y = int(stats[label, cv2.CC_STAT_TOP])
+            bbox_w = int(stats[label, cv2.CC_STAT_WIDTH])
+            bbox_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+
+            blob_coords = np.where(labels == label)
+            if blob_coords[0].size == 0:
+                continue
+            blob_scores = heat[blob_coords]
+            total_intensity = (
+                float(np.sum(blob_scores)) if blob_scores.size > 0 else 0.0
+            )
+            if total_intensity > 0:
+                weighted_y = float(
+                    np.sum(blob_coords[0] * blob_scores) / total_intensity
+                )
+                weighted_x = float(
+                    np.sum(blob_coords[1] * blob_scores) / total_intensity
+                )
+            else:
+                weighted_y, weighted_x = float(np.mean(blob_coords[0])), float(
+                    np.mean(blob_coords[1])
+                )
+
+            # distance from image center
+            img_h, img_w = heat.shape
+            img_center_x, img_center_y = img_w / 2.0, img_h / 2.0
+            distance = float(
+                np.sqrt(
+                    (weighted_x - img_center_x) ** 2 + (weighted_y - img_center_y) ** 2
+                )
+            )
+
+            # Compute quadrant index (radial sectors) relative to image center
+            try:
+                angle = math.degrees(
+                    math.atan2(img_center_y - weighted_y, weighted_x - img_center_x)
+                )
+                if angle < 0:
+                    angle += 360
+                quadrant_size = 360.0 / 10.0
+                quadrant = int(angle // quadrant_size)
+            except Exception:
+                quadrant = None
+
+            blobs_in_image.append(
+                {
+                    "blob_label": int(label),
+                    "area_pixels": int(area),
+                    "bounding_box": {
+                        "x": bbox_x,
+                        "y": bbox_y,
+                        "width": bbox_w,
+                        "height": bbox_h,
+                    },
+                    "mean_intensity": (
+                        float(np.mean(blob_scores)) if blob_scores.size > 0 else 0.0
+                    ),
+                    "max_intensity": (
+                        float(np.max(blob_scores)) if blob_scores.size > 0 else 0.0
+                    ),
+                    "geometric_centroid": (
+                        (float(centroids[label][0]), float(centroids[label][1]))
+                        if centroids is not None and len(centroids) > label
+                        else (np.nan, np.nan)
+                    ),
+                    "weighted_centroid": (weighted_x, weighted_y),
+                    "distance_from_center": distance,
+                    # Quadrant will be computed in the exporter if needed; include placeholder
+                    "quadrant": quadrant,
+                }
+            )
+
+        image_filename = (
+            test_data_loader.test.image_filepaths[i]
+            if hasattr(test_data_loader.test, "image_filepaths")
+            else None
+        )
+        image_gt_label = (
+            int(ground_truth_labels[i]) if i < len(ground_truth_labels) else None
+        )
+        analysis_results.append(
+            {
+                "image_idx": i,
+                "image_filename": image_filename,
+                "image_gt_label": image_gt_label,
+                "blobs": blobs_in_image,
+            }
+        )
+
+    # Save blob CSVs using the plotting util
+    try:
+        compute_and_save_blob_analysis(
+            class_save_dir,
+            analysis_results,
+            test_data_loader.test.image_filepaths,
+            ground_truth_labels,
+            img_scores=image_level_scores,
+            optimal_threshold=optimal_threshold,
+        )
+    except Exception:
+        logging.exception("Failed to compute & save blob analysis CSVs")
 
     plot_individual_visualizations(
         test_images=test_images_list,
