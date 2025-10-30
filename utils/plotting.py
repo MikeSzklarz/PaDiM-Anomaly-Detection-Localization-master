@@ -2,6 +2,7 @@ import os
 import numpy as np
 import logging
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import seaborn as sns
 import pandas as pd
 import scipy.stats as sps
@@ -224,6 +225,245 @@ def plot_mean_anomaly_maps(
         ax_up.axes.yaxis.set_visible(False)
 
     save_path = os.path.join(class_save_dir, "mean_anomaly_maps.png")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(save_path)
+    plt.close(fig)
+
+
+def plot_mean_anomaly_maps_global_scale(
+    class_save_dir,
+    gt_labels,
+    anomaly_maps_raw,
+    score_maps,
+    img_scores=None,
+    optimal_threshold=None,
+):
+    """Same as `plot_mean_anomaly_maps` but uses a global vmin/vmax across all panels.
+
+    This ensures all subplots share the same color scale so visual comparisons are
+    consistent between TN/FP/FN/TP and between raw/upscaled maps.
+    """
+    logging.info("Generating mean anomaly maps (global scale) for TN/FP/FN/TP...")
+
+    if img_scores is None:
+        logging.warning(
+            "plot_mean_anomaly_maps_global_scale called without img_scores; defaulting to grouping by gt only (will show TN and TP columns only)."
+        )
+
+    if optimal_threshold is None:
+        used_threshold = 0.5
+        logging.info(
+            "No optimal_threshold provided; using default threshold=0.5 for image-level classification."
+        )
+    else:
+        used_threshold = optimal_threshold
+
+    if img_scores is not None:
+        preds = (np.asarray(img_scores) >= used_threshold).astype(int)
+    else:
+        preds = None
+
+    outcome_names = ["TN", "FP", "TP", "FN"]
+    mean_raw = {k: np.zeros_like(anomaly_maps_raw[0]) for k in outcome_names}
+    mean_up = {k: np.zeros_like(score_maps[0]) for k in outcome_names}
+
+    gt = np.asarray(gt_labels)
+
+    def _mean_for(indices, arr):
+        if len(indices) == 0:
+            return np.zeros_like(arr[0])
+        return np.mean(arr[indices], axis=0)
+
+    if preds is not None:
+        tn_idx = np.where((gt == 0) & (preds == 0))[0]
+        fp_idx = np.where((gt == 0) & (preds == 1))[0]
+        fn_idx = np.where((gt == 1) & (preds == 0))[0]
+        tp_idx = np.where((gt == 1) & (preds == 1))[0]
+    else:
+        tn_idx = np.where(gt == 0)[0]
+        fp_idx = np.array([], dtype=int)
+        fn_idx = np.array([], dtype=int)
+        tp_idx = np.where(gt == 1)[0]
+
+    idx_map = {"TN": tn_idx, "FP": fp_idx, "FN": fn_idx, "TP": tp_idx}
+
+    for name in outcome_names:
+        inds = idx_map[name]
+        mean_raw[name] = _mean_for(inds, anomaly_maps_raw)
+        mean_up[name] = _mean_for(inds, score_maps)
+
+    # Compute global vmin/vmax from the ORIGINAL input maps (not the means).
+    # This makes the color scaling comparable to the underlying data range.
+    try:
+        arr_raw = np.asarray(anomaly_maps_raw)
+        arr_up = np.asarray(score_maps)
+        # flatten safely to handle mismatched shapes
+        combined_flat = np.concatenate([arr_raw.ravel(), arr_up.ravel()])
+        global_min = float(np.nanmin(combined_flat))
+        global_max = float(np.nanmax(combined_flat))
+    except Exception:
+        # fallback: use 0..1
+        global_min, global_max = 0.0, 1.0
+
+    # avoid degenerate vmin==vmax
+    if global_max <= global_min:
+        global_max = global_min + 1e-6
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig.suptitle(
+        "Mean Anomaly Maps (top: raw, bottom: upscaled) - Global Scale", fontsize=18
+    )
+
+    for col, name in enumerate(outcome_names):
+        inds = idx_map[name]
+        count = len(inds)
+
+        ax_raw = axes[0, col]
+        im_raw = ax_raw.imshow(
+            mean_raw[name], cmap="jet", vmin=global_min, vmax=global_max
+        )
+        ax_raw.set_title(f"{name} (n={count})")
+        fig.colorbar(im_raw, ax=ax_raw, fraction=0.046, pad=0.02)
+
+        ax_up = axes[1, col]
+        im_up = ax_up.imshow(
+            mean_up[name], cmap="jet", vmin=global_min, vmax=global_max
+        )
+        ax_up.set_title(f"{name} (n={count})")
+        fig.colorbar(im_up, ax=ax_up, fraction=0.046, pad=0.02)
+
+        ax_raw.axes.xaxis.set_visible(False)
+        ax_raw.axes.yaxis.set_visible(False)
+        ax_up.axes.xaxis.set_visible(False)
+        ax_up.axes.yaxis.set_visible(False)
+
+    save_path = os.path.join(class_save_dir, "mean_anomaly_maps_global_scale.png")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(save_path)
+    plt.close(fig)
+
+
+def plot_mean_anomaly_maps_log_scale(
+    class_save_dir,
+    gt_labels,
+    anomaly_maps_raw,
+    score_maps,
+    img_scores=None,
+    optimal_threshold=None,
+):
+    """Same as `plot_mean_anomaly_maps` but applies a log1p transform to the mean maps.
+
+    The log transform (log1p) compresses large values and can make subtle structure
+    in lower-value regions more visible. Values are clipped at 0 before transform to
+    avoid invalid inputs.
+    """
+    logging.info("Generating mean anomaly maps (log scale) for TN/FP/FN/TP...")
+
+    if img_scores is None:
+        logging.warning(
+            "plot_mean_anomaly_maps_log_scale called without img_scores; defaulting to grouping by gt only (will show TN and TP columns only)."
+        )
+
+    if optimal_threshold is None:
+        used_threshold = 0.5
+        logging.info(
+            "No optimal_threshold provided; using default threshold=0.5 for image-level classification."
+        )
+    else:
+        used_threshold = optimal_threshold
+
+    if img_scores is not None:
+        preds = (np.asarray(img_scores) >= used_threshold).astype(int)
+    else:
+        preds = None
+
+    outcome_names = ["TN", "FP", "TP", "FN"]
+    mean_raw = {k: np.zeros_like(anomaly_maps_raw[0]) for k in outcome_names}
+    mean_up = {k: np.zeros_like(score_maps[0]) for k in outcome_names}
+
+    gt = np.asarray(gt_labels)
+
+    def _mean_for(indices, arr):
+        if len(indices) == 0:
+            return np.zeros_like(arr[0])
+        return np.mean(arr[indices], axis=0)
+
+    if preds is not None:
+        tn_idx = np.where((gt == 0) & (preds == 0))[0]
+        fp_idx = np.where((gt == 0) & (preds == 1))[0]
+        fn_idx = np.where((gt == 1) & (preds == 0))[0]
+        tp_idx = np.where((gt == 1) & (preds == 1))[0]
+    else:
+        tn_idx = np.where(gt == 0)[0]
+        fp_idx = np.array([], dtype=int)
+        fn_idx = np.array([], dtype=int)
+        tp_idx = np.where(gt == 1)[0]
+
+    idx_map = {"TN": tn_idx, "FP": fp_idx, "FN": fn_idx, "TP": tp_idx}
+
+    # We'll use LogNorm on the ORIGINAL input maps. Compute per-outcome means
+    # from the raw inputs (no transform), then set the LogNorm vmin to a small
+    # positive percentile of the positive input values so that a few tiny
+    # nonzero values don't collapse the dynamic range.
+
+    for name in outcome_names:
+        inds = idx_map[name]
+        mean_raw[name] = _mean_for(inds, anomaly_maps_raw)
+        mean_up[name] = _mean_for(inds, score_maps)
+
+    # Compute positive-value percentile vmin from the original input maps
+    try:
+        arr_raw = np.asarray(anomaly_maps_raw)
+        arr_up = np.asarray(score_maps)
+        pos_raw = arr_raw[arr_raw > 0]
+        pos_up = arr_up[arr_up > 0]
+        if pos_raw.size == 0 and pos_up.size == 0:
+            # no positive values: fall back to tiny positive vmin and vmax from max
+            vmin = 1e-6
+            vmax = float(np.nanmax(np.concatenate([arr_raw.ravel(), arr_up.ravel()])))
+        else:
+            combined_pos = np.concatenate([pos_raw.ravel(), pos_up.ravel()])
+            p = 1.0  # percentile to use for vmin
+            vmin = float(np.nanpercentile(combined_pos, p))
+            if vmin <= 0 or np.isnan(vmin):
+                vmin = float(np.min(combined_pos[combined_pos > 0]))
+            vmax = float(np.nanmax(np.concatenate([arr_raw.ravel(), arr_up.ravel()])))
+    except Exception:
+        vmin, vmax = 1e-6, 1.0
+
+    # Safety: ensure vmin < vmax and vmin > 0 for LogNorm
+    if vmin <= 0 or np.isnan(vmin):
+        vmin = 1e-6
+    if vmax <= vmin or np.isnan(vmax):
+        vmax = vmin * 10.0
+
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig.suptitle(
+        "Mean Anomaly Maps (top: raw, bottom: upscaled) - Log Scale", fontsize=18
+    )
+
+    for col, name in enumerate(outcome_names):
+        inds = idx_map[name]
+        count = len(inds)
+
+        ax_raw = axes[0, col]
+        im_raw = ax_raw.imshow(mean_raw[name], cmap="jet", norm=norm)
+        ax_raw.set_title(f"{name} (n={count})")
+        fig.colorbar(im_raw, ax=ax_raw, fraction=0.046, pad=0.02)
+
+        ax_up = axes[1, col]
+        im_up = ax_up.imshow(mean_up[name], cmap="jet", norm=norm)
+        ax_up.set_title(f"{name} (n={count})")
+        fig.colorbar(im_up, ax=ax_up, fraction=0.046, pad=0.02)
+
+        ax_raw.axes.xaxis.set_visible(False)
+        ax_raw.axes.yaxis.set_visible(False)
+        ax_up.axes.xaxis.set_visible(False)
+        ax_up.axes.yaxis.set_visible(False)
+
+    save_path = os.path.join(class_save_dir, "mean_anomaly_maps_log_scale.png")
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path)
     plt.close(fig)

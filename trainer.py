@@ -20,6 +20,8 @@ from utils.embeddings import get_batch_embeddings
 from utils.plotting import (
     plot_summary_visuals,
     plot_mean_anomaly_maps,
+    plot_mean_anomaly_maps_global_scale,
+    plot_mean_anomaly_maps_log_scale,
     plot_individual_visualizations,
     plot_patch_score_distributions,
 )
@@ -370,6 +372,22 @@ def run_class_processing(
         pr_auc=image_pr_auc,
     )
     plot_mean_anomaly_maps(
+        class_save_dir,
+        ground_truth_labels,
+        anomaly_maps_raw_norm,
+        score_maps,
+        img_scores=image_level_scores,
+        optimal_threshold=optimal_threshold,
+    )
+    plot_mean_anomaly_maps_global_scale(
+        class_save_dir,
+        ground_truth_labels,
+        anomaly_maps_raw_norm,
+        score_maps,
+        img_scores=image_level_scores,
+        optimal_threshold=optimal_threshold,
+    )
+    plot_mean_anomaly_maps_log_scale(
         class_save_dir,
         ground_truth_labels,
         anomaly_maps_raw_norm,
