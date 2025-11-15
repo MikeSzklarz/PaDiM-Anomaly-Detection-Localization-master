@@ -30,6 +30,7 @@ from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
 )
+import sklearn
 from torch.amp import autocast
 from sklearn.metrics import average_precision_score
 import scipy.stats as sps
@@ -50,9 +51,20 @@ from utils.plotting import (
     plot_mean_anomaly_maps,
     plot_individual_visualizations,
     plot_patch_score_distributions,
+    save_feature_importance,
+    plot_roc_pr,
+    save_confusion_matrix,
+    tsne_plot,
+    explain_with_shap,
 )
 
 import trainer
+import joblib
+import json
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from utils.misc import feature_factory_from_blob_df
+from sklearn.model_selection import train_test_split
 
 INTERMEDIATE_FEATURE_MAPS = []
 
@@ -122,6 +134,16 @@ def main():
     parser.add_argument("--mahalanobis_on_gpu", action="store_true")
     parser.add_argument("--stats_on_gpu", action="store_true")
     parser.add_argument("--test_sample_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--use_blob_classifier",
+        action="store_true",
+        help="Train and use a RandomForest on aggregated blob features to override PaDiM predictions",
+    )
+    parser.add_argument(
+        "--retrain_blob_classifier",
+        action="store_true",
+        help="Force retraining of the blob classifier even if saved artifacts exist in the class folder",
+    )
 
     args = parser.parse_args()
 
@@ -195,6 +217,405 @@ def main():
                 INTERMEDIATE_FEATURE_MAPS,
             )
             all_class_results.append(class_summary)
+
+            # Optional: Train/use blob-level RandomForest to override PaDiM predictions
+            if getattr(args, "use_blob_classifier", False):
+                try:
+                    # Determine class save dir the same way trainer does
+                    if (
+                        getattr(args_copy, "test_class_path", None)
+                        or getattr(args_copy, "test_class_name", None) is not None
+                    ):
+                        if getattr(args_copy, "test_class_path", None):
+                            test_abs = os.path.abspath(args_copy.test_class_path)
+                            test_class_name = os.path.basename(test_abs)
+                        else:
+                            test_class_name = args_copy.test_class_name
+                        class_save_dir = os.path.join(
+                            args_copy.master_save_dir,
+                            f"train_{class_name}_test_{test_class_name}",
+                        )
+                    else:
+                        class_save_dir = os.path.join(
+                            args_copy.master_save_dir, class_name
+                        )
+
+                    blob_csv = os.path.join(class_save_dir, "blob_analysis.csv")
+                    model_path = os.path.join(
+                        class_save_dir, "blob_classifier_model.joblib"
+                    )
+                    scaler_path = os.path.join(
+                        class_save_dir, "blob_classifier_scaler.joblib"
+                    )
+                    feat_path = os.path.join(
+                        class_save_dir, "blob_classifier_features.json"
+                    )
+
+                    # Preferred: check for a training blob CSV exported for the training split
+                    train_blob_csv = os.path.join(
+                        class_save_dir, "blob_analysis_train.csv"
+                    )
+                    test_blob_csv = os.path.join(class_save_dir, "blob_analysis.csv")
+
+                    model_exists = (
+                        os.path.exists(model_path)
+                        and os.path.exists(scaler_path)
+                        and os.path.exists(feat_path)
+                    )
+
+                    clf = None
+                    scaler = None
+                    saved_feats = None
+                    # When True we evaluated on an internal holdout from the test CSV
+                    eval_on_holdout = False
+                    # When True we evaluated on an internal holdout from the test CSV
+                    eval_on_holdout = False
+
+                    # Train on dedicated training blob CSV if available
+                    if os.path.exists(train_blob_csv):
+                        logging.info(
+                            f"Training blob classifier from training CSV: {train_blob_csv}"
+                        )
+                        # Version tag for logging: training from dedicated train CSV
+                        logging.info("Blob classifier mode: TRAIN_FROM_TRAIN_CSV")
+                        X_train_df, y_train, feat_names_train = (
+                            feature_factory_from_blob_df(train_blob_csv)
+                        )
+                        if y_train is None or (len(np.unique(y_train)) < 2):
+                            logging.warning(
+                                f"Insufficient labels in {train_blob_csv} to train blob classifier for {class_name}."
+                            )
+                        else:
+                            logging.info(
+                                "Blob classifier training: starting fit on training CSV."
+                            )
+                            try:
+                                logging.info(
+                                    f"Training CSV rows: {len(X_train_df)}, features: {len(X_train_df.columns)}"
+                                )
+                                # class distribution
+                                if hasattr(y_train, "value_counts"):
+                                    logging.info(
+                                        f"Training class distribution: {y_train.value_counts().to_dict()}"
+                                    )
+                                else:
+                                    logging.info(
+                                        f"Training classes (unique counts): {np.unique(y_train, return_counts=True)}"
+                                    )
+                            except Exception:
+                                logging.exception("Failed to log training CSV summary")
+                            X_train_vals = X_train_df.fillna(0).values
+                            scaler = StandardScaler().fit(X_train_vals)
+                            clf = RandomForestClassifier(
+                                n_estimators=200, random_state=args.seed
+                            )
+                            clf.fit(scaler.transform(X_train_vals), y_train.values)
+                            # Log model metadata
+                            try:
+                                logging.info(
+                                    f"Trained RandomForest (sklearn {sklearn.__version__}) with params: {clf.get_params()}"
+                                )
+                            except Exception:
+                                logging.exception("Failed to log classifier params")
+                            os.makedirs(class_save_dir, exist_ok=True)
+                            joblib.dump(clf, model_path)
+                            joblib.dump(scaler, scaler_path)
+                            with open(feat_path, "w") as fh:
+                                json.dump(list(X_train_df.columns), fh)
+                            saved_feats = list(X_train_df.columns)
+                            logging.info(
+                                f"Saved blob classifier artifacts to: model={model_path}, scaler={scaler_path}, feats={feat_path}"
+                            )
+
+                    # If we still don't have a trained model, consider loading existing ones
+                    if (
+                        not clf
+                        and model_exists
+                        and not getattr(args, "retrain_blob_classifier", False)
+                    ):
+                        # Version tag for logging: loading existing trained artifacts
+                        logging.info("Blob classifier mode: LOAD_EXISTING_ARTIFACTS")
+                        try:
+                            clf = joblib.load(model_path)
+                            scaler = joblib.load(scaler_path)
+                            with open(feat_path, "r") as fh:
+                                saved_feats = json.load(fh)
+                            try:
+                                logging.info(
+                                    f"Loaded existing blob classifier artifacts. model={model_path}, scaler={scaler_path}, feats={feat_path}"
+                                )
+                                if hasattr(clf, "get_params"):
+                                    logging.info(
+                                        f"Loaded RandomForest (sklearn {sklearn.__version__}) params: {clf.get_params()}"
+                                    )
+                            except Exception:
+                                logging.exception("Failed to log loaded classifier metadata")
+                        except Exception:
+                            logging.exception(
+                                "Failed to load existing blob classifier artifacts; will attempt to (re)train if possible."
+                            )
+
+                    # If no train CSV, fallback: split the available test blob CSV into train/holdout
+                    if (clf is None) and os.path.exists(test_blob_csv):
+                        # Version tag for logging: fallback internal split from test blob CSV
+                        logging.info("Blob classifier mode: FALLBACK_SPLIT_FROM_TEST_CSV")
+                        df_blob = pd.read_csv(test_blob_csv)
+                        X_all, y_all, feat_names_all = feature_factory_from_blob_df(
+                            df_blob
+                        )
+                        if (
+                            y_all is None
+                            or (len(np.unique(y_all)) < 2)
+                            or (len(X_all) < 10)
+                        ):
+                            logging.warning(
+                                f"Insufficient or single-class data in {test_blob_csv}; skipping blob classifier for {class_name}."
+                            )
+                        else:
+                            # safe stratified split
+                            try:
+                                X_train, X_hold, y_train, y_hold = train_test_split(
+                                    X_all,
+                                    y_all,
+                                    test_size=0.3,
+                                    random_state=args.seed,
+                                    stratify=y_all,
+                                )
+                            except Exception:
+                                X_train, X_hold, y_train, y_hold = train_test_split(
+                                    X_all,
+                                    y_all,
+                                    test_size=0.3,
+                                    random_state=args.seed,
+                                    stratify=None,
+                                )
+                                try:
+                                    logging.info(
+                                        f"Performed fallback split: total={len(X_all)}, train={len(X_train)}, holdout={len(X_hold)}"
+                                    )
+                                    if hasattr(y_all, "value_counts"):
+                                        logging.info(
+                                            f"Overall class distribution: {y_all.value_counts().to_dict()}"
+                                        )
+                                    if hasattr(y_train, "value_counts"):
+                                        logging.info(
+                                            f"Train class distribution: {y_train.value_counts().to_dict()}"
+                                        )
+                                    if hasattr(y_hold, "value_counts"):
+                                        logging.info(
+                                            f"Holdout class distribution: {y_hold.value_counts().to_dict()}"
+                                        )
+                                except Exception:
+                                    logging.exception("Failed to log split distributions")
+                            X_train_vals = X_train.fillna(0).values
+                            scaler = StandardScaler().fit(X_train_vals)
+                            clf = RandomForestClassifier(
+                                n_estimators=200, random_state=args.seed
+                            )
+                            clf.fit(scaler.transform(X_train_vals), y_train.values)
+                            os.makedirs(class_save_dir, exist_ok=True)
+                            joblib.dump(clf, model_path)
+                            joblib.dump(scaler, scaler_path)
+                            saved_feats = list(X_train.columns)
+                            # prepare evaluation set
+                            X_ordered = X_hold.reindex(columns=saved_feats).fillna(0)
+                            y_eval = y_hold
+                            X_eval_scaled = scaler.transform(X_ordered.values)
+                            eval_preds = clf.predict(X_eval_scaled).astype(int)
+                            new_preds = eval_preds
+                            X_scaled = X_eval_scaled
+                            y = y_eval
+                            eval_on_holdout = True
+
+                    # If we have a model and a test CSV, run evaluation on the test CSV
+                    if clf is not None and os.path.exists(test_blob_csv) and not eval_on_holdout:
+                        try:
+                            # load test blobs and evaluate
+                            X_test_df, y_test, _ = feature_factory_from_blob_df(
+                                test_blob_csv
+                            )
+                            logging.info("Evaluating on full test CSV because no internal holdout was used.")
+                            if saved_feats is None:
+                                # try to derive from X_test
+                                saved_feats = list(X_test_df.columns)
+                            X_ordered = X_test_df.reindex(columns=saved_feats).fillna(0)
+                            X_pred = X_ordered.values
+                            X_scaled = scaler.transform(X_pred)
+                            new_preds = clf.predict(X_scaled).astype(int)
+                            y = y_test
+                        except Exception:
+                            logging.exception(
+                                "Failed to evaluate blob classifier on test CSV"
+                            )
+                    else:
+                        if clf is None:
+                            logging.info(
+                                "No blob classifier trained or available for this class."
+                            )
+                        elif not os.path.exists(test_blob_csv):
+                            logging.warning(
+                                f"Test blob CSV not found at {test_blob_csv}; cannot evaluate blob classifier for {class_name}."
+                            )
+
+                    # If we obtained predictions and labels, compute metrics and diagnostics
+                    if (clf is not None) and (
+                        ("new_preds" in locals()) and (y is not None)
+                    ):
+                        try:
+                            # If y is a pandas Series, ensure ordering alignment
+                            if hasattr(y, "values"):
+                                y_vals = y.values
+                            else:
+                                y_vals = np.asarray(list(y))
+                            tn, fp, fn, tp = confusion_matrix(y_vals, new_preds).ravel()
+                        except Exception:
+                            tn = fp = fn = tp = 0
+                        epsilon = 1e-6
+                        precision = tp / (tp + fp + epsilon)
+                        recall = tp / (tp + fn + epsilon)
+                        f1_score = (
+                            2 * (precision * recall) / (precision + recall + epsilon)
+                        )
+                        class_summary.update(
+                            {
+                                "precision": round(precision, 4),
+                                "recall": round(recall, 4),
+                                "f1_score": round(f1_score, 4),
+                                "true_negatives": int(tn),
+                                "false_positives": int(fp),
+                                "false_negatives": int(fn),
+                                "true_positives": int(tp),
+                            }
+                        )
+                        logging.info(
+                            f"Blob classifier predictions used to override metrics for class {class_name}."
+                        )
+                        try:
+                            logging.info(
+                                f"Blob classifier results: precision={precision:.4f}, recall={recall:.4f}, f1={f1_score:.4f}, TN={tn}, FP={fp}, FN={fn}, TP={tp}"
+                            )
+                        except Exception:
+                            logging.exception("Failed to log blob classifier summary stats")
+
+                        # Diagnostics: save preds CSV, report, plots
+                        try:
+                            out_dir = class_save_dir
+                            probs = (
+                                clf.predict_proba(X_scaled)[:, 1]
+                                if hasattr(clf, "predict_proba")
+                                else None
+                            )
+                            preds_df = pd.DataFrame(
+                                {
+                                    "image_name": list(X_ordered.index),
+                                    "true_label": (
+                                        list(y_vals)
+                                        if y is not None
+                                        else [None] * len(X_ordered)
+                                    ),
+                                    "pred": list(new_preds),
+                                    "prob": (
+                                        list(probs)
+                                        if probs is not None
+                                        else [None] * len(X_ordered)
+                                    ),
+                                }
+                            )
+                            preds_df.to_csv(
+                                os.path.join(
+                                    out_dir, "blob_classifier_predictions.csv"
+                                ),
+                                index=False,
+                            )
+
+                            report = {
+                                "used_blob_classifier": True,
+                                "n_images": int(X_ordered.shape[0]),
+                                "n_features": int(X_ordered.shape[1]),
+                            }
+                            if hasattr(clf, "feature_importances_"):
+                                importances = clf.feature_importances_
+                                feat_list = list(X_ordered.columns)
+                                top_idx = np.argsort(importances)[::-1][:10]
+                                report["top_features"] = [
+                                    {
+                                        "feature": feat_list[i],
+                                        "importance": float(importances[i]),
+                                    }
+                                    for i in top_idx
+                                ]
+                            with open(
+                                os.path.join(out_dir, "blob_classifier_report.json"),
+                                "w",
+                            ) as fh:
+                                json.dump(report, fh, indent=2)
+
+                            try:
+                                if hasattr(clf, "feature_importances_"):
+                                    save_feature_importance(
+                                        clf.feature_importances_,
+                                        list(X_ordered.columns),
+                                        out_dir,
+                                    )
+                            except Exception:
+                                logging.exception(
+                                    "Failed to save RF feature importances"
+                                )
+
+                            try:
+                                if (y is not None) and (probs is not None):
+                                    plot_roc_pr(y_vals, probs, out_dir)
+                            except Exception:
+                                logging.exception(
+                                    "Failed to plot ROC/PR for blob classifier"
+                                )
+
+                            try:
+                                if y is not None:
+                                    save_confusion_matrix(
+                                        y_vals,
+                                        new_preds,
+                                        out_dir,
+                                        labels=["normal", "anomaly"],
+                                    )
+                            except Exception:
+                                logging.exception(
+                                    "Failed to save confusion matrix for blob classifier"
+                                )
+
+                            try:
+                                tsne_plot(
+                                    X_ordered,
+                                    pd.Series(y_vals) if y is not None else None,
+                                    new_preds,
+                                    out_dir,
+                                    sample_frac=1.0,
+                                )
+                            except Exception:
+                                logging.exception(
+                                    "Failed to create t-SNE for blob features"
+                                )
+
+                            try:
+                                explain_with_shap(
+                                    clf,
+                                    X_ordered,
+                                    out_dir,
+                                    list(X_ordered.columns),
+                                    y=pd.Series(y_vals) if y is not None else None,
+                                )
+                            except Exception:
+                                logging.exception(
+                                    "Failed to compute SHAP explanations for blob classifier"
+                                )
+                        except Exception:
+                            logging.exception(
+                                "Failed to write blob classifier diagnostics"
+                            )
+                except Exception:
+                    logging.exception(
+                        f"Blob classifier training/eval failed for {class_name}"
+                    )
         except Exception as e:
             logging.exception(f"Error processing class {class_name}: {e}")
     else:
@@ -215,6 +636,560 @@ def main():
                     INTERMEDIATE_FEATURE_MAPS,
                 )
                 all_class_results.append(class_summary)
+                # Optional blob-classifier training/eval (override PaDiM predictions)
+                if getattr(args, "use_blob_classifier", False):
+                    try:
+                        if (
+                            getattr(args, "test_class_path", None)
+                            or getattr(args, "test_class_name", None) is not None
+                        ):
+                            if getattr(args, "test_class_path", None):
+                                test_abs = os.path.abspath(args.test_class_path)
+                                test_class_name = os.path.basename(test_abs)
+                            else:
+                                test_class_name = args.test_class_name
+                            class_save_dir = os.path.join(
+                                args.master_save_dir,
+                                f"train_{class_name}_test_{test_class_name}",
+                            )
+                        else:
+                            class_save_dir = os.path.join(
+                                args.master_save_dir, class_name
+                            )
+
+                        blob_csv = os.path.join(class_save_dir, "blob_analysis.csv")
+                        model_path = os.path.join(
+                            class_save_dir, "blob_classifier_model.joblib"
+                        )
+                        scaler_path = os.path.join(
+                            class_save_dir, "blob_classifier_scaler.joblib"
+                        )
+                        feat_path = os.path.join(
+                            class_save_dir, "blob_classifier_features.json"
+                        )
+
+                        if os.path.exists(blob_csv):
+                            # Preferred: check for a training blob CSV exported for the training split
+                            train_blob_csv = os.path.join(
+                                class_save_dir, "blob_analysis_train.csv"
+                            )
+                            test_blob_csv = os.path.join(
+                                class_save_dir, "blob_analysis.csv"
+                            )
+
+                            model_exists = (
+                                os.path.exists(model_path)
+                                and os.path.exists(scaler_path)
+                                and os.path.exists(feat_path)
+                            )
+
+                            clf = None
+                            scaler = None
+                            saved_feats = None
+
+                            # Train on dedicated training blob CSV if available
+                            if os.path.exists(train_blob_csv):
+                                logging.info(
+                                    f"Training blob classifier from training CSV: {train_blob_csv}"
+                                )
+                                # Version tag for logging: training from dedicated train CSV
+                                logging.info("Blob classifier mode: TRAIN_FROM_TRAIN_CSV")
+                                X_train_df, y_train, feat_names_train = (
+                                    feature_factory_from_blob_df(train_blob_csv)
+                                )
+                                if y_train is None or (len(np.unique(y_train)) < 2):
+                                    logging.warning(
+                                        f"Insufficient labels in {train_blob_csv} to train blob classifier for {class_name}."
+                                    )
+                                else:
+                                    logging.info(
+                                        "Blob classifier training: starting fit on training CSV."
+                                    )
+                                    try:
+                                        logging.info(
+                                            f"Training CSV rows: {len(X_train_df)}, features: {len(X_train_df.columns)}"
+                                        )
+                                        if hasattr(y_train, "value_counts"):
+                                            logging.info(
+                                                f"Training class distribution: {y_train.value_counts().to_dict()}"
+                                            )
+                                        else:
+                                            logging.info(
+                                                f"Training classes (unique counts): {np.unique(y_train, return_counts=True)}"
+                                            )
+                                    except Exception:
+                                        logging.exception("Failed to log training CSV summary")
+                                    X_train_vals = X_train_df.fillna(0).values
+                                    scaler = StandardScaler().fit(X_train_vals)
+                                    clf = RandomForestClassifier(
+                                        n_estimators=200, random_state=args.seed
+                                    )
+                                    clf.fit(
+                                        scaler.transform(X_train_vals), y_train.values
+                                    )
+                                    try:
+                                        logging.info(
+                                            f"Trained RandomForest (sklearn {sklearn.__version__}) with params: {clf.get_params()}"
+                                        )
+                                    except Exception:
+                                        logging.exception("Failed to log classifier params")
+                                    os.makedirs(class_save_dir, exist_ok=True)
+                                    joblib.dump(clf, model_path)
+                                    joblib.dump(scaler, scaler_path)
+                                    with open(feat_path, "w") as fh:
+                                        json.dump(list(X_train_df.columns), fh)
+                                    saved_feats = list(X_train_df.columns)
+                                    logging.info(
+                                        f"Saved blob classifier artifacts to: model={model_path}, scaler={scaler_path}, feats={feat_path}"
+                                    )
+
+                            # If we still don't have a trained model, consider loading existing ones
+                            if (
+                                not clf
+                                and model_exists
+                                and not getattr(args, "retrain_blob_classifier", False)
+                            ):
+                                # Version tag for logging: loading existing trained artifacts
+                                logging.info("Blob classifier mode: LOAD_EXISTING_ARTIFACTS")
+                                try:
+                                    clf = joblib.load(model_path)
+                                    scaler = joblib.load(scaler_path)
+                                    with open(feat_path, "r") as fh:
+                                        saved_feats = json.load(fh)
+                                    try:
+                                        logging.info(
+                                            f"Loaded existing blob classifier artifacts. model={model_path}, scaler={scaler_path}, feats={feat_path}"
+                                        )
+                                        if hasattr(clf, "get_params"):
+                                            logging.info(
+                                                f"Loaded RandomForest (sklearn {sklearn.__version__}) params: {clf.get_params()}"
+                                            )
+                                    except Exception:
+                                        logging.exception("Failed to log loaded classifier metadata")
+                                except Exception:
+                                    logging.exception(
+                                        "Failed to load existing blob classifier artifacts; will attempt to (re)train if possible."
+                                    )
+
+                            # If no train CSV, fallback: split the available test blob CSV into train/holdout
+                            if (clf is None) and os.path.exists(test_blob_csv):
+                                # Version tag for logging: fallback internal split from test blob CSV
+                                logging.info("Blob classifier mode: FALLBACK_SPLIT_FROM_TEST_CSV")
+                                df_blob = pd.read_csv(test_blob_csv)
+                                X_all, y_all, feat_names_all = (
+                                    feature_factory_from_blob_df(df_blob)
+                                )
+                                if (
+                                    y_all is None
+                                    or (len(np.unique(y_all)) < 2)
+                                    or (len(X_all) < 10)
+                                ):
+                                    logging.warning(
+                                        f"Insufficient or single-class data in {test_blob_csv}; skipping blob classifier for {class_name}."
+                                    )
+                                else:
+                                    # safe stratified split
+                                    try:
+                                        X_train, X_hold, y_train, y_hold = (
+                                            train_test_split(
+                                                X_all,
+                                                y_all,
+                                                test_size=0.3,
+                                                random_state=args.seed,
+                                                stratify=y_all,
+                                            )
+                                        )
+                                    except Exception:
+                                        X_train, X_hold, y_train, y_hold = (
+                                            train_test_split(
+                                                X_all,
+                                                y_all,
+                                                test_size=0.3,
+                                                random_state=args.seed,
+                                                stratify=None,
+                                            )
+                                        )
+                                    try:
+                                        logging.info(
+                                            f"Performed fallback split: total={len(X_all)}, train={len(X_train)}, holdout={len(X_hold)}"
+                                        )
+                                        if hasattr(y_all, "value_counts"):
+                                            logging.info(
+                                                f"Overall class distribution: {y_all.value_counts().to_dict()}"
+                                            )
+                                        if hasattr(y_train, "value_counts"):
+                                            logging.info(
+                                                f"Train class distribution: {y_train.value_counts().to_dict()}"
+                                            )
+                                        if hasattr(y_hold, "value_counts"):
+                                            logging.info(
+                                                f"Holdout class distribution: {y_hold.value_counts().to_dict()}"
+                                            )
+                                    except Exception:
+                                        logging.exception("Failed to log split distributions")
+                                    X_train_vals = X_train.fillna(0).values
+                                    scaler = StandardScaler().fit(X_train_vals)
+                                    clf = RandomForestClassifier(
+                                        n_estimators=200, random_state=args.seed
+                                    )
+                                    clf.fit(
+                                        scaler.transform(X_train_vals), y_train.values
+                                    )
+                                    os.makedirs(class_save_dir, exist_ok=True)
+                                    joblib.dump(clf, model_path)
+                                    joblib.dump(scaler, scaler_path)
+                                    saved_feats = list(X_train.columns)
+                                    # prepare evaluation set
+                                    X_ordered = X_hold.reindex(
+                                        columns=saved_feats
+                                    ).fillna(0)
+                                    y_eval = y_hold
+                                    X_eval_scaled = scaler.transform(X_ordered.values)
+                                    eval_preds = clf.predict(X_eval_scaled).astype(int)
+                                    new_preds = eval_preds
+                                    X_scaled = X_eval_scaled
+                                    y = y_eval
+                                    eval_on_holdout = True
+
+                            # If we have a model and a test CSV, run evaluation on the test CSV
+                            if clf is not None and os.path.exists(test_blob_csv) and not eval_on_holdout:
+                                try:
+                                    # load test blobs and evaluate
+                                    X_test_df, y_test, _ = feature_factory_from_blob_df(
+                                        test_blob_csv
+                                    )
+                                    logging.info("Evaluating on full test CSV because no internal holdout was used.")
+                                    try:
+                                        logging.info(
+                                            f"Evaluating blob classifier on test CSV: {test_blob_csv} (n={len(X_test_df)})"
+                                        )
+                                        if hasattr(y_test, "value_counts"):
+                                            logging.info(
+                                                f"Test class distribution: {y_test.value_counts().to_dict()}"
+                                            )
+                                    except Exception:
+                                        logging.exception("Failed to log test CSV summary")
+                                    if saved_feats is None:
+                                        # try to derive from X_test
+                                        saved_feats = list(X_test_df.columns)
+                                    X_ordered = X_test_df.reindex(
+                                        columns=saved_feats
+                                    ).fillna(0)
+                                    X_pred = X_ordered.values
+                                    X_scaled = scaler.transform(X_pred)
+                                    new_preds = clf.predict(X_scaled).astype(int)
+                                    y = y_test
+                                except Exception:
+                                    logging.exception(
+                                        "Failed to evaluate blob classifier on test CSV"
+                                    )
+                            else:
+                                if clf is None:
+                                    logging.info(
+                                        "No blob classifier trained or available for this class."
+                                    )
+                                elif not os.path.exists(test_blob_csv):
+                                    logging.warning(
+                                        f"Test blob CSV not found at {test_blob_csv}; cannot evaluate blob classifier for {class_name}."
+                                    )
+
+                            # If we obtained predictions and labels, compute metrics and diagnostics
+                            if (clf is not None) and (
+                                ("new_preds" in locals()) and (y is not None)
+                            ):
+                                try:
+                                    # If y is a pandas Series, ensure ordering alignment
+                                    if hasattr(y, "values"):
+                                        y_vals = y.values
+                                    else:
+                                        y_vals = np.asarray(list(y))
+                                    tn, fp, fn, tp = confusion_matrix(
+                                        y_vals, new_preds
+                                    ).ravel()
+                                except Exception:
+                                    tn = fp = fn = tp = 0
+                                epsilon = 1e-6
+                                precision = tp / (tp + fp + epsilon)
+                                recall = tp / (tp + fn + epsilon)
+                                f1_score = (
+                                    2
+                                    * (precision * recall)
+                                    / (precision + recall + epsilon)
+                                )
+                                class_summary.update(
+                                    {
+                                        "precision": round(precision, 4),
+                                        "recall": round(recall, 4),
+                                        "f1_score": round(f1_score, 4),
+                                        "true_negatives": int(tn),
+                                        "false_positives": int(fp),
+                                        "false_negatives": int(fn),
+                                        "true_positives": int(tp),
+                                    }
+                                )
+                                logging.info(
+                                    f"Blob classifier predictions used to override metrics for class {class_name}."
+                                )
+                                try:
+                                    logging.info(
+                                        f"Blob classifier predictions used to override metrics for class {class_name}."
+                                    )
+                                    logging.info(
+                                        f"Blob classifier results: precision={precision:.4f}, recall={recall:.4f}, f1={f1_score:.4f}, TN={tn}, FP={fp}, FN={fn}, TP={tp}"
+                                    )
+                                except Exception:
+                                    logging.exception("Failed to log blob classifier summary stats")
+
+                                # Diagnostics: save preds CSV, report, plots
+                                try:
+                                    out_dir = class_save_dir
+                                    probs = (
+                                        clf.predict_proba(X_scaled)[:, 1]
+                                        if hasattr(clf, "predict_proba")
+                                        else None
+                                    )
+                                    preds_df = pd.DataFrame(
+                                        {
+                                            "image_name": list(X_ordered.index),
+                                            "true_label": (
+                                                list(y_vals)
+                                                if y is not None
+                                                else [None] * len(X_ordered)
+                                            ),
+                                            "pred": list(new_preds),
+                                            "prob": (
+                                                list(probs)
+                                                if probs is not None
+                                                else [None] * len(X_ordered)
+                                            ),
+                                        }
+                                    )
+                                    preds_df.to_csv(
+                                        os.path.join(
+                                            out_dir, "blob_classifier_predictions.csv"
+                                        ),
+                                        index=False,
+                                    )
+
+                                    report = {
+                                        "used_blob_classifier": True,
+                                        "n_images": int(X_ordered.shape[0]),
+                                        "n_features": int(X_ordered.shape[1]),
+                                    }
+                                    if hasattr(clf, "feature_importances_"):
+                                        importances = clf.feature_importances_
+                                        feat_list = list(X_ordered.columns)
+                                        top_idx = np.argsort(importances)[::-1][:10]
+                                        report["top_features"] = [
+                                            {
+                                                "feature": feat_list[i],
+                                                "importance": float(importances[i]),
+                                            }
+                                            for i in top_idx
+                                        ]
+                                    with open(
+                                        os.path.join(
+                                            out_dir, "blob_classifier_report.json"
+                                        ),
+                                        "w",
+                                    ) as fh:
+                                        json.dump(report, fh, indent=2)
+
+                                    try:
+                                        if hasattr(clf, "feature_importances_"):
+                                            save_feature_importance(
+                                                clf.feature_importances_,
+                                                list(X_ordered.columns),
+                                                out_dir,
+                                            )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to save RF feature importances"
+                                        )
+
+                                    try:
+                                        if (y is not None) and (probs is not None):
+                                            plot_roc_pr(y_vals, probs, out_dir)
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to plot ROC/PR for blob classifier"
+                                        )
+
+                                    try:
+                                        if y is not None:
+                                            save_confusion_matrix(
+                                                y_vals,
+                                                new_preds,
+                                                out_dir,
+                                                labels=["normal", "anomaly"],
+                                            )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to save confusion matrix for blob classifier"
+                                        )
+
+                                    try:
+                                        tsne_plot(
+                                            X_ordered,
+                                            (
+                                                pd.Series(y_vals)
+                                                if y is not None
+                                                else None
+                                            ),
+                                            new_preds,
+                                            out_dir,
+                                            sample_frac=1.0,
+                                        )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to create t-SNE for blob features"
+                                        )
+
+                                    try:
+                                        explain_with_shap(
+                                            clf,
+                                            X_ordered,
+                                            out_dir,
+                                            list(X_ordered.columns),
+                                            y=(
+                                                pd.Series(y_vals)
+                                                if y is not None
+                                                else None
+                                            ),
+                                        )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to compute SHAP explanations for blob classifier"
+                                        )
+                                except Exception:
+                                    logging.exception(
+                                        "Failed to write blob classifier diagnostics"
+                                    )
+                                # --- Blob classifier diagnostics & verbose logging ---
+                                try:
+                                    out_dir = class_save_dir
+                                    probs = (
+                                        clf.predict_proba(X_scaled)[:, 1]
+                                        if hasattr(clf, "predict_proba")
+                                        else None
+                                    )
+                                    preds_df = pd.DataFrame(
+                                        {
+                                            "image_name": list(X_ordered.index),
+                                            "true_label": (
+                                                list(y.values)
+                                                if y is not None
+                                                else [None] * len(X_ordered)
+                                            ),
+                                            "pred": list(new_preds),
+                                            "prob": (
+                                                list(probs)
+                                                if probs is not None
+                                                else [None] * len(X_ordered)
+                                            ),
+                                        }
+                                    )
+                                    preds_df.to_csv(
+                                        os.path.join(
+                                            out_dir, "blob_classifier_predictions.csv"
+                                        ),
+                                        index=False,
+                                    )
+
+                                    report = {
+                                        "used_blob_classifier": True,
+                                        "n_images": int(X_ordered.shape[0]),
+                                        "n_features": int(X_ordered.shape[1]),
+                                    }
+                                    if hasattr(clf, "feature_importances_"):
+                                        importances = clf.feature_importances_
+                                        feat_list = list(X_ordered.columns)
+                                        top_idx = np.argsort(importances)[::-1][:10]
+                                        report["top_features"] = [
+                                            {
+                                                "feature": feat_list[i],
+                                                "importance": float(importances[i]),
+                                            }
+                                            for i in top_idx
+                                        ]
+                                    with open(
+                                        os.path.join(
+                                            out_dir, "blob_classifier_report.json"
+                                        ),
+                                        "w",
+                                    ) as fh:
+                                        json.dump(report, fh, indent=2)
+
+                                    try:
+                                        if hasattr(clf, "feature_importances_"):
+                                            save_feature_importance(
+                                                clf.feature_importances_,
+                                                list(X_ordered.columns),
+                                                out_dir,
+                                            )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to save RF feature importances"
+                                        )
+
+                                    try:
+                                        if (y is not None) and (probs is not None):
+                                            plot_roc_pr(y.values, probs, out_dir)
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to plot ROC/PR for blob classifier"
+                                        )
+
+                                    try:
+                                        if y is not None:
+                                            save_confusion_matrix(
+                                                y.values,
+                                                new_preds,
+                                                out_dir,
+                                                labels=["normal", "anomaly"],
+                                            )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to save confusion matrix for blob classifier"
+                                        )
+
+                                    try:
+                                        tsne_plot(
+                                            X_ordered,
+                                            y,
+                                            new_preds,
+                                            out_dir,
+                                            sample_frac=1.0,
+                                        )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to create t-SNE for blob features"
+                                        )
+
+                                    try:
+                                        explain_with_shap(
+                                            clf,
+                                            X_ordered,
+                                            out_dir,
+                                            list(X_ordered.columns),
+                                            y=y,
+                                        )
+                                    except Exception:
+                                        logging.exception(
+                                            "Failed to compute SHAP explanations for blob classifier"
+                                        )
+                                except Exception:
+                                    logging.exception(
+                                        "Failed to write blob classifier diagnostics"
+                                    )
+                        else:
+                            logging.warning(
+                                f"Expected blob CSV not found at: {blob_csv}; cannot train/use blob classifier for {class_name}."
+                            )
+                    except Exception:
+                        logging.exception(
+                            f"Blob classifier training/eval failed for {class_name}"
+                        )
             except Exception as e:
                 logging.error(
                     f"!!! FAILED to process class {class_name}. Error: {e}",
