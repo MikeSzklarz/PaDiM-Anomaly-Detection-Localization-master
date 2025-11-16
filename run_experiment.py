@@ -1,61 +1,24 @@
-# run_experiment.py (Version 3)
-
-# --- Core Libraries ---
 import os
 import random
-import pickle
 import logging
 import argparse
-from collections import OrderedDict
 
-# --- Numerical and Scientific Libraries ---
-import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter
-from scipy import ndimage
 
-# --- Machine Learning and Deep Learning ---
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from torchvision.models import (
     wide_resnet50_2,
     resnet18,
     efficientnet_b5,
     EfficientNet_B5_Weights,
 )
-from sklearn.metrics import (
-    roc_auc_score,
-    roc_curve,
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-)
-from torch.amp import autocast
-from sklearn.metrics import average_precision_score
-import scipy.stats as sps
 
-# --- Visualization ---
-import matplotlib.pyplot as plt
-
-# --- Custom Dataloader ---
-# Assumes bowtie.py is in a 'datasets' subfolder
 import datasets.bowtie as bowtie
 import copy
-
-# Bring commonly used helpers from smaller utils modules to keep this script slim.
-from utils.embeddings import get_batch_embeddings, concatenate_embeddings
-from utils.misc import denormalize_image_for_display
-from utils.plotting import (
-    plot_summary_visuals,
-    plot_mean_anomaly_maps,
-    plot_individual_visualizations,
-    plot_patch_score_distributions,
-)
 
 import trainer
 
 INTERMEDIATE_FEATURE_MAPS = []
-
 
 def setup_logging(log_path, log_name):
     """Configures a master logger for the entire experiment run."""
@@ -100,6 +63,13 @@ def main():
         description="PaDiM Anomaly Detection Experiment Runner"
     )
     parser.add_argument("--model_architecture", type=str, default="wide_resnet50_2")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="bowtie",
+        choices=["bowtie", "mvtec"],
+        help="Which dataset loader to use."
+    )
     parser.add_argument(
         "--data_path",
         type=str,

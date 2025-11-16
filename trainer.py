@@ -11,11 +11,9 @@ from scipy import ndimage
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from sklearn.metrics import average_precision_score
 import scipy.stats as sps
-import csv
-import json
-import math
 
 import datasets.bowtie as bowtie
+import datasets.mvtec as mvtec
 from utils.embeddings import get_batch_embeddings
 from utils.plotting import (
     plot_summary_visuals,
@@ -23,7 +21,6 @@ from utils.plotting import (
     plot_individual_visualizations,
     plot_patch_score_distributions,
 )
-from utils.plotting import compute_and_save_blob_analysis
 import cv2
 
 
@@ -92,30 +89,70 @@ def run_class_processing(
         class_save_dir = os.path.join(args.master_save_dir, train_class_name)
     os.makedirs(class_save_dir, exist_ok=True)
 
-    train_data_loader = bowtie.BowtieDataLoader(
-        dataset_path=args.data_path,
-        class_name=train_class_name,
-        resize=args.resize,
-        cropsize=args.cropsize,
-        seed=args.seed,
-        augmentations_enabled=args.augmentations_enabled,
-        horizontal_flip=args.horizontal_flip,
-        vertical_flip=args.vertical_flip,
-        augmentation_prob=args.augmentation_prob,
-    )
+    if args.dataset == "mvtec":
+        train_data_loader = mvtec.MVTecDataLoader(
+            dataset_path=args.data_path,
+            class_name=train_class_name,
+            resize=args.resize,
+            cropsize=args.cropsize,
+        )
+        test_data_loader = mvtec.MVTecDataLoader(
+            dataset_path=test_dataset_path,
+            class_name=test_class_name,
+            resize=args.resize,
+            cropsize=args.cropsize,
+        )
 
-    test_data_loader = bowtie.BowtieDataLoader(
-        dataset_path=test_dataset_path,
-        class_name=test_class_name,
-        resize=args.resize,
-        cropsize=args.cropsize,
-        seed=args.seed,
-        augmentations_enabled=False,
-        horizontal_flip=False,
-        vertical_flip=False,
-        augmentation_prob=0.0,
-        normal_test_sample_ratio=args.test_sample_ratio,
-    )
+    else:  # default: Bowtie
+        train_data_loader = bowtie.BowtieDataLoader(
+            dataset_path=args.data_path,
+            class_name=train_class_name,
+            resize=args.resize,
+            cropsize=args.cropsize,
+            seed=args.seed,
+            augmentations_enabled=args.augmentations_enabled,
+            horizontal_flip=args.horizontal_flip,
+            vertical_flip=args.vertical_flip,
+            augmentation_prob=args.augmentation_prob,
+        )
+
+        test_data_loader = bowtie.BowtieDataLoader(
+            dataset_path=test_dataset_path,
+            class_name=test_class_name,
+            resize=args.resize,
+            cropsize=args.cropsize,
+            seed=args.seed,
+            augmentations_enabled=False,
+            horizontal_flip=False,
+            vertical_flip=False,
+            augmentation_prob=0.0,
+            normal_test_sample_ratio=args.test_sample_ratio,
+        )
+
+    # train_data_loader = bowtie.BowtieDataLoader(
+    #     dataset_path=args.data_path,
+    #     class_name=train_class_name,
+    #     resize=args.resize,
+    #     cropsize=args.cropsize,
+    #     seed=args.seed,
+    #     augmentations_enabled=args.augmentations_enabled,
+    #     horizontal_flip=args.horizontal_flip,
+    #     vertical_flip=args.vertical_flip,
+    #     augmentation_prob=args.augmentation_prob,
+    # )
+
+    # test_data_loader = bowtie.BowtieDataLoader(
+    #     dataset_path=test_dataset_path,
+    #     class_name=test_class_name,
+    #     resize=args.resize,
+    #     cropsize=args.cropsize,
+    #     seed=args.seed,
+    #     augmentations_enabled=False,
+    #     horizontal_flip=False,
+    #     vertical_flip=False,
+    #     augmentation_prob=0.0,
+    #     normal_test_sample_ratio=args.test_sample_ratio,
+    # )
 
     logging.info("------------------- EXPERIMENT CONFIGURATION -------------------")
     logging.info(f"[DATASET] Class Name: {class_name}")
@@ -454,136 +491,6 @@ def run_class_processing(
             }
         )
 
-    # Per-image metrics CSV writing removed per request. `per_image_stats` is still
-    # computed and passed to plotting functions, but we will not persist a
-    # `per_image_metrics.csv` file to avoid creating large per-image artifacts.
-    logging.info("Per-image metrics CSV export disabled by configuration.")
-
-    # --- Blob detection & detailed per-blob extraction (match notebook behavior) ---
-    # We will detect connected components on a binary mask defined by the
-    # threshold_norm computed from normal images and extract properties per blob.
-    analysis_results = []
-    n_images = normalized_scores.shape[0]
-    for i in range(n_images):
-        heat = normalized_scores[i]
-        thresh_val = threshold_norm
-        mask = (heat >= thresh_val).astype(np.uint8) * 255
-        # Morphological cleanup to mimic notebook
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            mask, connectivity=8
-        )
-
-        blobs_in_image = []
-        for label in range(1, num_labels):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if area <= 0:
-                continue
-            bbox_x = int(stats[label, cv2.CC_STAT_LEFT])
-            bbox_y = int(stats[label, cv2.CC_STAT_TOP])
-            bbox_w = int(stats[label, cv2.CC_STAT_WIDTH])
-            bbox_h = int(stats[label, cv2.CC_STAT_HEIGHT])
-
-            blob_coords = np.where(labels == label)
-            if blob_coords[0].size == 0:
-                continue
-            blob_scores = heat[blob_coords]
-            total_intensity = (
-                float(np.sum(blob_scores)) if blob_scores.size > 0 else 0.0
-            )
-            if total_intensity > 0:
-                weighted_y = float(
-                    np.sum(blob_coords[0] * blob_scores) / total_intensity
-                )
-                weighted_x = float(
-                    np.sum(blob_coords[1] * blob_scores) / total_intensity
-                )
-            else:
-                weighted_y, weighted_x = float(np.mean(blob_coords[0])), float(
-                    np.mean(blob_coords[1])
-                )
-
-            # distance from image center
-            img_h, img_w = heat.shape
-            img_center_x, img_center_y = img_w / 2.0, img_h / 2.0
-            distance = float(
-                np.sqrt(
-                    (weighted_x - img_center_x) ** 2 + (weighted_y - img_center_y) ** 2
-                )
-            )
-
-            # Compute quadrant index (radial sectors) relative to image center
-            try:
-                angle = math.degrees(
-                    math.atan2(img_center_y - weighted_y, weighted_x - img_center_x)
-                )
-                if angle < 0:
-                    angle += 360
-                quadrant_size = 360.0 / 10.0
-                quadrant = int(angle // quadrant_size)
-            except Exception:
-                quadrant = None
-
-            blobs_in_image.append(
-                {
-                    "blob_label": int(label),
-                    "area_pixels": int(area),
-                    "bounding_box": {
-                        "x": bbox_x,
-                        "y": bbox_y,
-                        "width": bbox_w,
-                        "height": bbox_h,
-                    },
-                    "mean_intensity": (
-                        float(np.mean(blob_scores)) if blob_scores.size > 0 else 0.0
-                    ),
-                    "max_intensity": (
-                        float(np.max(blob_scores)) if blob_scores.size > 0 else 0.0
-                    ),
-                    "geometric_centroid": (
-                        (float(centroids[label][0]), float(centroids[label][1]))
-                        if centroids is not None and len(centroids) > label
-                        else (np.nan, np.nan)
-                    ),
-                    "weighted_centroid": (weighted_x, weighted_y),
-                    "distance_from_center": distance,
-                    # Quadrant will be computed in the exporter if needed; include placeholder
-                    "quadrant": quadrant,
-                }
-            )
-
-        image_filename = (
-            test_data_loader.test.image_filepaths[i]
-            if hasattr(test_data_loader.test, "image_filepaths")
-            else None
-        )
-        image_gt_label = (
-            int(ground_truth_labels[i]) if i < len(ground_truth_labels) else None
-        )
-        analysis_results.append(
-            {
-                "image_idx": i,
-                "image_filename": image_filename,
-                "image_gt_label": image_gt_label,
-                "blobs": blobs_in_image,
-            }
-        )
-
-    # Save blob CSVs using the plotting util
-    try:
-        compute_and_save_blob_analysis(
-            class_save_dir,
-            analysis_results,
-            test_data_loader.test.image_filepaths,
-            ground_truth_labels,
-            img_scores=image_level_scores,
-            optimal_threshold=optimal_threshold,
-        )
-    except Exception:
-        logging.exception("Failed to compute & save blob analysis CSVs")
-
     plot_individual_visualizations(
         test_images=test_images_list,
         raw_maps=anomaly_maps_raw,
@@ -604,43 +511,9 @@ def run_class_processing(
     precision = tp / (tp + fp + epsilon)
     recall = tp / (tp + fn + epsilon)
     f1_score = 2 * (precision * recall) / (precision + recall + epsilon)
-    logging.info(
-        f"Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1_score:.4f}"
-    )
+    
     normal_scores = image_level_scores[ground_truth_labels == 0]
     anomalous_scores = image_level_scores[ground_truth_labels == 1]
-
-    cohen_d, wass, mw_p, auc_ci_low, auc_ci_high = (
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-
-    def cohens_d(a, b):
-        nx, ny = len(a), len(b)
-        dof = nx + ny - 2
-        pooled_std = np.sqrt(
-            ((nx - 1) * np.var(a, ddof=1) + (ny - 1) * np.var(b, ddof=1)) / dof
-        )
-        return (np.mean(a) - np.mean(b)) / (pooled_std + 1e-12)
-
-    try:
-        if len(normal_scores) > 1 and len(anomalous_scores) > 1:
-            cohen_d = float(cohens_d(anomalous_scores, normal_scores))
-    except Exception:
-        pass
-    try:
-        wass = float(sps.wasserstein_distance(normal_scores, anomalous_scores))
-    except Exception:
-        pass
-    try:
-        _, mw_p = sps.mannwhitneyu(
-            normal_scores, anomalous_scores, alternative="two-sided"
-        )
-    except Exception:
-        pass
 
     def bootstrap_auc(y_true, y_scores, n_bootstrap=1000, seed=0):
         rng = np.random.RandomState(seed)
@@ -672,57 +545,8 @@ def run_class_processing(
     logging.info(
         f"Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1_score:.4f}"
     )
-    if cohen_d is not None:
-        logging.info(f"Cohen_d: {cohen_d:.4f}")
-    if wass is not None:
-        logging.info(f"Wasserstein: {wass:.4f}")
-    if mw_p is not None:
-        logging.info(f"Mann-Whitney p: {mw_p:.4e}")
     if auc_ci_low is not None:
         logging.info(f"ROC AUC CI: [{auc_ci_low:.4f}, {auc_ci_high:.4f}]")
-
-    try:
-        class_report = {
-            "class_name": class_name,
-            "roc_auc": float(image_roc_auc),
-            "pr_auc": float(image_pr_auc) if image_pr_auc is not None else None,
-            "roc_auc_ci": (
-                [auc_ci_low, auc_ci_high]
-                if (auc_ci_low is not None and auc_ci_high is not None)
-                else None
-            ),
-            "cohen_d": cohen_d,
-            "wasserstein": wass,
-            "mannwhitney_p": mw_p,
-            "num_images": int(len(image_level_scores)),
-        }
-
-        def agg_by_label(values, labels):
-            vals = np.array(values)
-            return {
-                "mean_normal": (
-                    float(np.mean(vals[labels == 0])) if np.any(labels == 0) else None
-                ),
-                "mean_anomalous": (
-                    float(np.mean(vals[labels == 1])) if np.any(labels == 1) else None
-                ),
-                "median_normal": (
-                    float(np.median(vals[labels == 0])) if np.any(labels == 0) else None
-                ),
-                "median_anomalous": (
-                    float(np.median(vals[labels == 1])) if np.any(labels == 1) else None
-                ),
-            }
-
-        class_report["image_level_score_stats"] = agg_by_label(
-            image_level_scores, ground_truth_labels
-        )
-        class_report_path = os.path.join(class_save_dir, "class_report.json")
-
-        with open(class_report_path, "w") as jf:
-            json.dump(class_report, jf, indent=2)
-    except Exception:
-        logging.exception("Failed to write class_report.json")
 
     return {
         "class_name": class_name,
@@ -735,9 +559,6 @@ def run_class_processing(
         "false_positives": fp,
         "false_negatives": fn,
         "true_positives": tp,
-        "cohen_d": round(cohen_d, 4) if cohen_d is not None else None,
-        "wasserstein": round(wass, 4) if wass is not None else None,
-        "mannwhitney_p": round(mw_p, 6) if mw_p is not None else None,
         "roc_auc_ci_low": round(auc_ci_low, 4) if auc_ci_low is not None else None,
         "roc_auc_ci_high": round(auc_ci_high, 4) if auc_ci_high is not None else None,
     }

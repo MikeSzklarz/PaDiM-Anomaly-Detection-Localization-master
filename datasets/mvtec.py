@@ -22,6 +22,22 @@ CLASS_NAMES = [
     "zipper",
 ]
 
+class MVTecDataLoader:
+    def __init__(self, dataset_path, class_name, resize, cropsize):
+        self.train = MVTecDataset(
+            dataset_path=dataset_path,
+            class_name=class_name,
+            is_train=True,
+            resize=resize,
+            cropsize=cropsize,
+        )
+        self.test = MVTecDataset(
+            dataset_path=dataset_path,
+            class_name=class_name,
+            is_train=False,
+            resize=resize,
+            cropsize=cropsize,
+        )
 
 class MVTecDataset(Dataset):
     def __init__(
@@ -42,6 +58,9 @@ class MVTecDataset(Dataset):
         self.cropsize = cropsize
 
         self.x, self.y = self.load_dataset_folder()
+
+        self.image_filepaths = self.x
+        self.labels = self.y
 
         self.transform_x = T.Compose(
             [
