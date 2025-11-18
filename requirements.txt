@@ -6,3 +6,6 @@ scikit-image
 torchvision
 seaborn
 statsmodels
+pandas
+opencv-python
+scipy
