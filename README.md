@@ -120,12 +120,12 @@ This code assumes a dataset layout where each class has `train` and `test` subfo
 
 ```
 /path/to/dataset/
-    ├── bottle/                          <-- Class Name
+    ├── bottle/                  <-- Class Name
     │   ├── train/
-    │   │   └── good/                <-- Normal training images
+    │   │   └── good/            <-- Normal training images
     │   └── test/
-    │       ├── good/                  <-- (Optional) Normal test images
-    │       ├── broken_large/     <-- Defect type 1
+    │       ├── good/            <-- (Optional) Normal test images
+    │       ├── broken_large/    <-- Defect type 1
     │       └── contamination/   <-- Defect type 2
     └── cable/
 ```
@@ -136,7 +136,7 @@ This code assumes a dataset layout where each class has `train` and `test` subfo
 /path/to/dataset/
     ├── class_name_1/
     │   ├── train/
-    │   │   └── good/                 <-- All normal images
+    │   │   └── good/            <-- All normal images
     │   └── test/
     │       ├── defect_type_A/   <-- Anomalous images
     │       └── defect_type_B/
