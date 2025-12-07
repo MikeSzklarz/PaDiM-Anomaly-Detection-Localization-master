@@ -81,6 +81,11 @@ def main():
     parser.add_argument("--cropsize", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--save_distribution", action="store_true")
+    parser.add_argument(
+        "--blob_analysis",
+        action="store_true",
+        help="Enable blob-level analysis, blob CSVs and visualizations (disabled by default)",
+    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--augmentations_enabled", action="store_true")
     parser.add_argument("--horizontal_flip", action="store_true")

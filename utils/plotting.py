@@ -434,3 +434,53 @@ def plot_patch_score_distributions(class_save_dir, gt_labels, anomaly_maps_raw):
             os.path.join(class_save_dir, "patch_score_distribution_comparative.png")
         )
         plt.close(fig)
+        
+def plot_blob_analysis_grid(
+    save_dir,
+    image_name,
+    class_tag, # TP, TN, FP, FN
+    original_image,
+    score_map,
+    percentiles,
+    binary_masks
+):
+    """
+    Saves a 1 x (N+1) grid. 
+    Col 0: Original Image.
+    Col 1..N: Original Image + Red Overlay for the specific percentile mask.
+    """
+    
+    # Create folder structure: save_dir / <tag>
+    target_dir = os.path.join(save_dir, class_tag)
+    os.makedirs(target_dir, exist_ok=True)
+    
+    num_plots = len(percentiles) + 1
+    fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
+    
+    # 1. Plot Original
+    img_denorm = denormalize_image_for_display(original_image)
+    axes[0].imshow(img_denorm)
+    axes[0].set_title("Original")
+    axes[0].axis('off')
+    
+    # 2. Plot Overlays
+    for i, p in enumerate(percentiles):
+        ax = axes[i + 1]
+        mask = binary_masks[i]
+        
+        # Display original
+        ax.imshow(img_denorm)
+        
+        # Create a red overlay
+        # Create an RGBA image where the mask is Red, background is transparent
+        overlay = np.zeros((mask.shape[0], mask.shape[1], 4))
+        overlay[mask == 1] = [1.0, 0.0, 0.0, 0.5] # Red with 0.5 alpha
+        
+        ax.imshow(overlay)
+        ax.set_title(f"Top {100-p:.1f}% (>{p}th %ile)")
+        ax.axis('off')
+        
+    plt.tight_layout()
+    save_filename = f"{image_name}_blob_analysis.png"
+    plt.savefig(os.path.join(target_dir, save_filename), bbox_inches='tight')
+    plt.close(fig)

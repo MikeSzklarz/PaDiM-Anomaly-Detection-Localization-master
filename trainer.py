@@ -11,6 +11,9 @@ from scipy import ndimage
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from sklearn.metrics import average_precision_score
 import scipy.stats as sps
+import math
+import pandas as pd
+import cv2
 
 import datasets.bowtie as bowtie
 import datasets.mvtec as mvtec
@@ -20,8 +23,8 @@ from utils.plotting import (
     plot_mean_anomaly_maps,
     plot_individual_visualizations,
     plot_patch_score_distributions,
+    plot_blob_analysis_grid,
 )
-import cv2
 
 
 def run_class_processing(
@@ -128,31 +131,6 @@ def run_class_processing(
             augmentation_prob=0.0,
             normal_test_sample_ratio=args.test_sample_ratio,
         )
-
-    # train_data_loader = bowtie.BowtieDataLoader(
-    #     dataset_path=args.data_path,
-    #     class_name=train_class_name,
-    #     resize=args.resize,
-    #     cropsize=args.cropsize,
-    #     seed=args.seed,
-    #     augmentations_enabled=args.augmentations_enabled,
-    #     horizontal_flip=args.horizontal_flip,
-    #     vertical_flip=args.vertical_flip,
-    #     augmentation_prob=args.augmentation_prob,
-    # )
-
-    # test_data_loader = bowtie.BowtieDataLoader(
-    #     dataset_path=test_dataset_path,
-    #     class_name=test_class_name,
-    #     resize=args.resize,
-    #     cropsize=args.cropsize,
-    #     seed=args.seed,
-    #     augmentations_enabled=False,
-    #     horizontal_flip=False,
-    #     vertical_flip=False,
-    #     augmentation_prob=0.0,
-    #     normal_test_sample_ratio=args.test_sample_ratio,
-    # )
 
     logging.info("------------------- EXPERIMENT CONFIGURATION -------------------")
     logging.info(f"[DATASET] Class Name: {class_name}")
@@ -387,13 +365,10 @@ def run_class_processing(
     thresholds_from_roc = roc_curve(ground_truth_labels, image_level_scores)[2]
     optimal_threshold = thresholds_from_roc[best_idx]
 
-    # Writing to results.txt has been removed per request; log the key metrics instead.
     logging.info(f"Image-level ROC AUC: {image_roc_auc:.4f}")
     if image_pr_auc is not None:
         logging.info(f"Image-level PR AUC: {image_pr_auc:.4f}")
 
-    # Compute image-level predictions from the optimal threshold (keep this
-    # variable available for later metrics/plots even though we no longer write per-image CSVs).
     predictions = (image_level_scores >= optimal_threshold).astype(int)
 
     plot_summary_visuals(
@@ -415,6 +390,7 @@ def run_class_processing(
         optimal_threshold=optimal_threshold,
     )
 
+    # --- Metrics and Visualization Loop ---
     normal_indices = np.where(ground_truth_labels == 0)[0]
     if len(normal_indices) > 0:
         threshold_norm = np.percentile(normalized_scores[normal_indices].ravel(), 99)
@@ -422,75 +398,203 @@ def run_class_processing(
         threshold_norm = np.percentile(normalized_scores.ravel(), 99)
 
     per_image_stats = []
-    n_pixels = normalized_scores.shape[1] * normalized_scores.shape[2]
-    top1pct_n = max(1, int(np.ceil(0.01 * n_pixels)))
-    img_h, img_w = normalized_scores.shape[1], normalized_scores.shape[2]
-    center_coord = np.array([img_h / 2.0, img_w / 2.0])
-    for i in range(normalized_scores.shape[0]):
-        heat = normalized_scores[i]
-        flat = heat.ravel()
-        sorted_flat = np.sort(flat)
-        maxv = float(np.max(flat))
-        mean_top1pct = float(np.mean(sorted_flat[-top1pct_n:]))
-        p95 = float(np.percentile(flat, 95))
-        meanv = float(np.mean(flat))
-        medianv = float(np.median(flat))
-        stdv = float(np.std(flat))
-        skewv = float(sps.skew(flat))
-        kurtv = float(sps.kurtosis(flat))
-        frac_above = float(np.mean(flat >= threshold_norm))
-        mask = heat >= threshold_norm
-        num_components = 0
-        largest_cc_area = 0.0
-        mean_cc_area = 0.0
-        bbox_area = 0
-        centroid = (np.nan, np.nan)
-        centroid_dist = np.nan
-        if np.any(mask):
-            labeled, num = ndimage.label(mask)
-            num_components = int(num)
-            areas = ndimage.sum(mask.astype(float), labeled, range(1, num + 1))
-            if len(areas) > 0:
-                areas = np.array(areas)
-                largest_cc_area = float(np.max(areas))
-                mean_cc_area = float(np.mean(areas))
-            ys, xs = np.where(mask)
-            ymin, ymax = int(np.min(ys)), int(np.max(ys))
-            xmin, xmax = int(np.min(xs)), int(np.max(xs))
-            bbox_area = int((ymax - ymin + 1) * (xmax - xmin + 1))
-            try:
-                cy, cx = ndimage.center_of_mass(heat)
-                centroid = (float(cx), float(cy))
-                centroid_dist = float(np.linalg.norm(np.array([cy, cx]) - center_coord))
-            except Exception:
-                centroid = (np.nan, np.nan)
-                centroid_dist = np.nan
-        total_pixels = float(img_h * img_w)
-        per_image_stats.append(
-            {
-                "max": maxv,
-                "mean_top1pct": mean_top1pct,
-                "p95": p95,
-                "mean": meanv,
-                "median": medianv,
-                "std": stdv,
-                "skewness": skewv,
-                "kurtosis": kurtv,
-                "frac_above": frac_above,
-                "threshold": threshold_norm,
-                "num_components": num_components,
-                "largest_cc_area": largest_cc_area,
-                "largest_cc_frac": (
-                    largest_cc_area / total_pixels if total_pixels > 0 else 0.0
-                ),
-                "mean_cc_area": mean_cc_area,
-                "bbox_area": bbox_area,
-                "centroid_x": centroid[0],
-                "centroid_y": centroid[1],
-                "centroid_dist": centroid_dist,
-            }
-        )
+    
+    # --- New Feature: Blob Analysis Config ---
+    if getattr(args, "blob_analysis", False):
+        BLOB_PERCENTILES = [95, 99, 99.5, 99.9]
+        blob_results_data = []  # To store row data for CSV
+        blob_viz_dir = os.path.join(class_save_dir, "blob_visualizations")
 
+        n_pixels = normalized_scores.shape[1] * normalized_scores.shape[2]
+        top1pct_n = max(1, int(np.ceil(0.01 * n_pixels)))
+        img_h, img_w = normalized_scores.shape[1], normalized_scores.shape[2]
+        center_coord = np.array([img_h / 2.0, img_w / 2.0])
+        center_y, center_x = img_h / 2.0, img_w / 2.0
+
+        logging.info("Blob analysis enabled: processing images for blob metrics and visualizations...")
+
+        for i in range(normalized_scores.shape[0]):
+            heat = normalized_scores[i]
+            flat = heat.ravel()
+            sorted_flat = np.sort(flat)
+            maxv = float(np.max(flat))
+            mean_top1pct = float(np.mean(sorted_flat[-top1pct_n:]))
+            p95 = float(np.percentile(flat, 95))
+            meanv = float(np.mean(flat))
+            medianv = float(np.median(flat))
+            stdv = float(np.std(flat))
+            skewv = float(sps.skew(flat))
+            kurtv = float(sps.kurtosis(flat))
+            frac_above = float(np.mean(flat >= threshold_norm))
+            
+            # Standard Stats Mask (Existing Logic)
+            mask_std = heat >= threshold_norm
+            num_components = 0
+            largest_cc_area = 0.0
+            mean_cc_area = 0.0
+            bbox_area = 0
+            centroid = (np.nan, np.nan)
+            centroid_dist = np.nan
+            if np.any(mask_std):
+                labeled, num = ndimage.label(mask_std)
+                num_components = int(num)
+                areas = ndimage.sum(mask_std.astype(float), labeled, range(1, num + 1))
+                if len(areas) > 0:
+                    areas = np.array(areas)
+                    largest_cc_area = float(np.max(areas))
+                    mean_cc_area = float(np.mean(areas))
+                ys, xs = np.where(mask_std)
+                ymin, ymax = int(np.min(ys)), int(np.max(ys))
+                xmin, xmax = int(np.min(xs)), int(np.max(xs))
+                bbox_area = int((ymax - ymin + 1) * (xmax - xmin + 1))
+                try:
+                    cy, cx = ndimage.center_of_mass(heat)
+                    centroid = (float(cx), float(cy))
+                    centroid_dist = float(np.linalg.norm(np.array([cy, cx]) - center_coord))
+                except Exception:
+                    centroid = (np.nan, np.nan)
+                    centroid_dist = np.nan
+            total_pixels = float(img_h * img_w)
+            per_image_stats.append(
+                {
+                    "max": maxv,
+                    "mean_top1pct": mean_top1pct,
+                    "p95": p95,
+                    "mean": meanv,
+                    "median": medianv,
+                    "std": stdv,
+                    "skewness": skewv,
+                    "kurtosis": kurtv,
+                    "frac_above": frac_above,
+                    "threshold": threshold_norm,
+                    "num_components": num_components,
+                    "largest_cc_area": largest_cc_area,
+                    "largest_cc_frac": (
+                        largest_cc_area / total_pixels if total_pixels > 0 else 0.0
+                    ),
+                    "mean_cc_area": mean_cc_area,
+                    "bbox_area": bbox_area,
+                    "centroid_x": centroid[0],
+                    "centroid_y": centroid[1],
+                    "centroid_dist": centroid_dist,
+                }
+            )
+
+            # 1. Determine tags
+            gt = ground_truth_labels[i]
+            img_score = image_level_scores[i]
+            pred_label = 1 if img_score >= optimal_threshold else 0
+            
+            if gt == 0 and pred_label == 0: class_tag = "TN"
+            elif gt == 0 and pred_label == 1: class_tag = "FP"
+            elif gt == 1 and pred_label == 0: class_tag = "FN"
+            else: class_tag = "TP"
+
+            # 2. Paths and Names
+            filepath = test_data_loader.test.image_filepaths[i]
+            image_filename = os.path.splitext(os.path.basename(filepath))[0]
+            defect_type = os.path.basename(os.path.dirname(filepath))
+            
+            sub_path = os.path.join("normal" if gt == 0 else "anomalous", class_tag)
+            
+            current_img_masks = []
+
+            # 3. Percentile Loop
+            for p in BLOB_PERCENTILES:
+                thresh_val = np.percentile(heat, p)
+                mask_p = (heat >= thresh_val).astype(np.uint8)
+                current_img_masks.append(mask_p)
+
+                # CV2 Blob Detection
+                cnts, _ = cv2.findContours(mask_p, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if not cnts:
+                    continue
+
+                for blob_id, c in enumerate(cnts):
+                    area = cv2.contourArea(c)
+                    if area < 2: continue  # Filter noise
+
+                    # Intensity stats for this specific blob
+                    blob_mask = np.zeros_like(heat, dtype=np.uint8)
+                    cv2.drawContours(blob_mask, [c], -1, 1, thickness=-1)
+                    blob_values = heat[blob_mask == 1]
+                    mean_intensity = float(np.mean(blob_values))
+                    peak_intensity = float(np.max(blob_values))
+
+                    # Geometry
+                    M = cv2.moments(c)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                    else:
+                        cX, cY = center_x, center_y
+
+                    # Centroid Dist
+                    dist_from_center = math.sqrt((cX - center_x)**2 + (cY - center_y)**2)
+
+                    # Polar Angle (0-360 degrees)
+                    # dy inverted because image Y is top-down
+                    dy = center_y - cY 
+                    dx = cX - center_x
+                    angle_rad = math.atan2(dy, dx)
+                    angle_deg = math.degrees(angle_rad)
+                    if angle_deg < 0: angle_deg += 360
+
+                    # Roundness / Circularity
+                    perimeter = cv2.arcLength(c, True)
+                    if perimeter == 0:
+                        circularity = 0
+                    else:
+                        circularity = 4 * math.pi * area / (perimeter * perimeter)
+
+                    # Straightness / Aspect Ratio
+                    rect = cv2.minAreaRect(c)
+                    w_rect, h_rect = rect[1]
+                    if min(w_rect, h_rect) > 0:
+                        aspect_ratio = max(w_rect, h_rect) / min(w_rect, h_rect)
+                    else:
+                        aspect_ratio = 1.0
+
+                    blob_results_data.append({
+                        "Image_Name": image_filename,
+                        "Defect_Type": defect_type,
+                        "Class_Tag": class_tag,
+                        "Percentile": p,
+                        "Threshold_Value": thresh_val,
+                        "Blob_ID": blob_id,
+                        "Area_Pixels": area,
+                        "Mean_Intensity": mean_intensity,
+                        "Peak_Intensity": peak_intensity,
+                        "Centroid_X": cX,
+                        "Centroid_Y": cY,
+                        "Centroid_Dist": dist_from_center,
+                        "Polar_Angle": angle_deg,
+                        "Circularity": circularity,
+                        "Elongation_AR": aspect_ratio
+                    })
+            
+            # 4. Generate Visualization
+            plot_blob_analysis_grid(
+                save_dir=blob_viz_dir,
+                image_name=image_filename,
+                class_tag=sub_path,
+                original_image=test_images_list[i],
+                score_map=heat,
+                percentiles=BLOB_PERCENTILES,
+                binary_masks=current_img_masks
+            )
+    else:
+        logging.info("Blob analysis disabled: skipping blob metrics and visualizations.")
+
+    # --- Save Blob CSV ---
+    if blob_results_data:
+        df_blobs = pd.DataFrame(blob_results_data)
+        blob_csv_path = os.path.join(class_save_dir, f"{class_name}_blob_metrics.csv")
+        df_blobs.to_csv(blob_csv_path, index=False)
+        logging.info(f"Blob metrics CSV saved to: {blob_csv_path}")
+
+    # --- Continue with existing plotting ---
     plot_individual_visualizations(
         test_images=test_images_list,
         raw_maps=anomaly_maps_raw,
@@ -511,7 +615,7 @@ def run_class_processing(
     precision = tp / (tp + fp + epsilon)
     recall = tp / (tp + fn + epsilon)
     f1_score = 2 * (precision * recall) / (precision + recall + epsilon)
-    
+
     normal_scores = image_level_scores[ground_truth_labels == 0]
     anomalous_scores = image_level_scores[ground_truth_labels == 1]
 
@@ -537,7 +641,6 @@ def run_class_processing(
     except Exception:
         pass
 
-    # Writing to results.txt has been removed per request; log the summary instead.
     logging.info(f"Optimal Threshold: {optimal_threshold:.4f}")
     logging.info(
         f"True Negatives: {tn} | False Positives: {fp} | False Negatives: {fn} | True Positives: {tp}"
