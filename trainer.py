@@ -22,6 +22,8 @@ from utils.plotting import (
     plot_patch_score_distributions,
 )
 import cv2
+from utils.helpers import save_and_compress_image_splits, extract_phase_and_defect
+
 
 
 def run_class_processing(
@@ -128,31 +130,6 @@ def run_class_processing(
             augmentation_prob=0.0,
             normal_test_sample_ratio=args.test_sample_ratio,
         )
-
-    # train_data_loader = bowtie.BowtieDataLoader(
-    #     dataset_path=args.data_path,
-    #     class_name=train_class_name,
-    #     resize=args.resize,
-    #     cropsize=args.cropsize,
-    #     seed=args.seed,
-    #     augmentations_enabled=args.augmentations_enabled,
-    #     horizontal_flip=args.horizontal_flip,
-    #     vertical_flip=args.vertical_flip,
-    #     augmentation_prob=args.augmentation_prob,
-    # )
-
-    # test_data_loader = bowtie.BowtieDataLoader(
-    #     dataset_path=test_dataset_path,
-    #     class_name=test_class_name,
-    #     resize=args.resize,
-    #     cropsize=args.cropsize,
-    #     seed=args.seed,
-    #     augmentations_enabled=False,
-    #     horizontal_flip=False,
-    #     vertical_flip=False,
-    #     augmentation_prob=0.0,
-    #     normal_test_sample_ratio=args.test_sample_ratio,
-    # )
 
     logging.info("------------------- EXPERIMENT CONFIGURATION -------------------")
     logging.info(f"[DATASET] Class Name: {class_name}")
@@ -505,6 +482,14 @@ def run_class_processing(
         class_save_dir, ground_truth_labels, anomaly_maps_raw
     )
     logging.info(f"All individual results for class '{class_name}' saved.")
+
+    # Optionally save the actual train/test image splits (original full-resolution files)
+    if getattr(args, "save_split_images", False):
+        logging.info("Saving original train/test image splits to results (will compress afterwards)...")
+        try:
+            save_and_compress_image_splits(class_save_dir, train_class_name, train_data_loader.train, test_data_loader.test)
+        except Exception as e:
+            logging.exception(f"Failed while saving/compressing image splits: {e}")
 
     tn, fp, fn, tp = confusion_matrix(ground_truth_labels, predictions).ravel()
     epsilon = 1e-6

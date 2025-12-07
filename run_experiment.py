@@ -92,6 +92,11 @@ def main():
     parser.add_argument("--mahalanobis_on_gpu", action="store_true")
     parser.add_argument("--stats_on_gpu", action="store_true")
     parser.add_argument("--test_sample_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--save_split_images",
+        action="store_true",
+        help="If set, save the actual train/test image splits (original images) into the results and compress them.",
+    )
 
     args = parser.parse_args()
 

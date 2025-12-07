@@ -6,7 +6,7 @@ import seaborn as sns
 import pandas as pd
 from sklearn.metrics import roc_curve, confusion_matrix, ConfusionMatrixDisplay
 
-from .misc import denormalize_image_for_display
+from .helpers import denormalize_image_for_display
 
 
 def plot_summary_visuals(
